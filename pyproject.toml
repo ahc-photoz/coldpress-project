@@ -21,7 +21,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Astronomy",
 ]
 
-dependencies = ["numpy", "astropy"]
+dependencies = ["numpy", "astropy", "matplotlib"]
 
 [project.scripts]
 coldpress = "coldpress.cli:main"
