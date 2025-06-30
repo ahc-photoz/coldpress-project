@@ -1,0 +1,23 @@
+# Archivos de caché y compilados de Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Directorios de distribución / instalación
+/dist/
+/build/
+*.egg-info/
+*.egg
+
+# Entornos virtuales
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Archivos de sistema operativo
+.DS_Store
+Thumbs.db
