@@ -13,6 +13,7 @@ from . import (
     zmode_from_quantiles,
     zmedian_from_quantiles,
     zmean_from_quantiles,
+    zrandom_from_quantiles,
     zmean_err_from_quantiles,
     odds_from_quantiles,
     HPDCI_from_quantiles)
@@ -123,6 +124,7 @@ def measure_logic(args):
     d = {}
     for k in ['Z_MODE','Z_MEAN','Z_MEDIAN',
               'Z_MODE_ERR','Z_MEAN_ERR',
+              'Z_RANDOM',
               'Z_MIN_HPDCI68','Z_MAX_HPDCI68',
               'Z_MIN_HPDCI95','Z_MAX_HPDCI95',
               'ODDS_MODE','ODDS_MEAN']:
@@ -139,6 +141,7 @@ def measure_logic(args):
         d['Z_MODE'][i] = zmode_from_quantiles(quantiles, width=0.005)
         d['Z_MEAN'][i] = zmean_from_quantiles(quantiles)
         d['Z_MEDIAN'][i] = zmedian_from_quantiles(quantiles)
+        d['Z_RANDOM'][i] = zrandom_from_quantiles(quantiles)
         d['ODDS_MODE'][i] = odds_from_quantiles(quantiles, d['Z_MODE'][i])
         d['ODDS_MEAN'][i] = odds_from_quantiles(quantiles, d['Z_MEAN'][i])
         HPDCI68_mode_zmin, HPDCI68_mode_zmax = HPDCI_from_quantiles(quantiles, conf=0.68, zinside=d['Z_MODE'][i])
