@@ -37,11 +37,17 @@ __all__ = [
     'zrandom_from_quantiles',
     'odds_from_quantiles',
     'HPDCI_from_quantiles',
+    'reconstruct_pdf_from_quantiles',
+    'reconstruct_pdf_variational',
 ]
 
 import numpy as np
 import struct
 import sys
+from scipy.interpolate import CubicSpline, PchipInterpolator
+from scipy.integrate import quad
+from numpy.polynomial.legendre import leggauss
+
 
 def pdf_to_cdf(z_grid, Pz, Nquantiles=100):
     """ obtain a cumulative PDF by quantiles from a PDF """
@@ -79,7 +85,7 @@ def pdf_to_cdf(z_grid, Pz, Nquantiles=100):
     
     return qs
     
-def cdf_to_pdf(z_quantiles, dz=None, z_min=None, z_max=None, zvector=None):
+def cdf_to_pdf(z_quantiles, dz=None, z_min=None, z_max=None, zvector=None, method='linear'):
     """
     Given quantile locations z_quantiles (monotonic array of length M),
     where CDF F(z_quantiles[j]) = j/(M-1),
@@ -120,9 +126,22 @@ def cdf_to_pdf(z_quantiles, dz=None, z_min=None, z_max=None, zvector=None):
 
     # 1) Interpolate the CDF onto the regular grid
     #    Values outside [zq[0], zq[-1]] are clamped to 0 or 1
-    F_grid = np.interp(edges, zq, Fq, left=0.0, right=1.0)
-    
+    if method == 'linear':
+        F_grid = np.interp(edges, zq, Fq, left=0.0, right=1.0)
+    if method == 'spline':
+        F_grid = np.zeros(len(edges))
+        F_grid[edges < zq[0]] = 0.
+        F_grid[edges > zq[-1]] = 1.
+        inside = (edges >= zq[0]) & (edges <= zq[-1])
+        F_inside = monotone_natural_spline(edges[inside], zq, Fq)
+        F_grid[inside] = F_inside/F_inside[-1] # numerical errors in integration make F_inside[-1] not exactly 1 
     pdf = F_grid[1:] - F_grid[:-1]
+    
+#     if np.min(pdf) < 0:
+#         import code
+#         code.interact(local=locals())
+    
+    pdf /= np.sum(pdf*dz)
         
     if zvector is not None:
         return pdf
@@ -256,6 +275,9 @@ def encode_from_histograms(PDF, zvector, ini_quantiles=71, packetsize=80, tolera
     containing a compressed representation of the quantiles of the cumulative
     distribution function.
     """
+    if packetsize % 4 != 0:
+        raise ValueError(f"Error: packetsize must be a multiple of 4, but got {packetsize}.")
+
     if packetsize - ini_quantiles < 3:
         raise ValueError('Error: ini_quantiles must be at most packetsize-3')
         
@@ -440,3 +462,72 @@ def HPDCI_from_quantiles(quantiles, conf=0.68, zinside=None):
     dz = zmax-zmin
     best = np.argmin(dz)
     return (zmin[best], zmax[best])
+
+def reconstruct_pdf_from_quantiles(quantiles):
+    """
+    Reconstructs a stepwise PDF from its quantiles.
+
+    The probability density P(z) is assumed to be constant between
+    two consecutive quantiles, z_i and z_{i+1}.
+
+    Returns
+    -------
+    z_steps : ndarray
+        The redshift values for the edges of the steps (for plotting).
+    p_steps : ndarray
+        The probability density values for each step.
+    """
+    Nq = len(quantiles)
+    p_steps = (1.0 / (Nq - 1)) / (quantiles[1:] - quantiles[:-1])
+    z_steps = quantiles
+    z_steps_extended = np.concatenate(([z_steps[0]-0.001],z_steps,[z_steps[-1]+0.001]))
+    p_steps_extended = np.concatenate(([0],p_steps,[0]))
+    return z_steps_extended, p_steps_extended
+    
+def monotone_natural_spline(Xout, X, Y):
+    """
+    Interpolate (X, Y) with a natural cubic spline, then correct any
+    non-monotonic intervals using PCHIP interpolation.
+    
+    Parameters
+    ----------
+    X : array_like, shape (N,)
+        Strictly increasing abscissas of the knots.
+    Y : array_like, shape (N,)
+        Ordinates of the knots.
+    Xout : array_like
+        Points at which to evaluate the corrected monotone spline.
+    
+    Returns
+    -------
+    Yout : ndarray
+        Interpolated values at Xout, guaranteed monotonic on each segment.
+    """
+    # Fit natural and PCHIP splines
+    spline = CubicSpline(X, Y, bc_type='natural')
+    pchip = PchipInterpolator(X, Y)
+    
+    # natural is the default interpolation
+    Yout = spline(Xout)
+    
+    # Compute first derivative at knots and in the output grid
+    Yp  = spline(X, 1)
+    Ypp = spline(X, 2)
+    dYout = spline(Xout, 1)
+        
+    # Determine which interval each Xout belongs to
+    idx = np.searchsorted(X, Xout) - 1
+    idx = np.clip(idx, 0, len(X)-2)
+    
+    # Check monotonicity and switch to PCHIP if violated
+    for i in range(len(X)-1):
+        # intervals with negative slope OR non-positive knot slopes
+        mask = (idx == i) & ((dYout < 0) | (Yp[i] <= 0) | (Yp[i+1] <= 0))
+        if np.any(mask):
+            mask = (idx == i)
+            Yout[mask] = pchip(Xout[mask]) # intermediate quantile, use PCHIP
+             
+    return Yout
+    
+
+  

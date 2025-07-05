@@ -2,11 +2,13 @@
 # -*- coding: utf-8 -*-
 
 import argparse
+import os
 import sys
 import numpy as np
 from astropy.io import fits
 # Use relative imports as this file is inside the coldpress package
 from . import (
+    cdf_to_pdf,
     encode_from_histograms,
     decode_to_histograms,
     decode_quantiles,
@@ -16,11 +18,16 @@ from . import (
     zrandom_from_quantiles,
     zmean_err_from_quantiles,
     odds_from_quantiles,
-    HPDCI_from_quantiles)
+    HPDCI_from_quantiles,
+    reconstruct_pdf_from_quantiles)
 
 # --- Logic for the 'encode' command ---
 def encode_logic(args):
     """Contains all the logic from the original coldpress_encode.py script."""
+    if args.length % 4 != 0:
+        print(f"Error: Packet length (--length) must be a multiple of 4, but got {args.length}.", file=sys.stderr)
+        sys.exit(1)
+
     print(f"Opening input file: {args.input}")
 
     # Open the input file ONCE and do everything inside the 'with' block
@@ -34,8 +41,14 @@ def encode_logic(args):
         zvector = np.linspace(args.zmin, args.zmax, PDF.shape[1])
 
         print("Compressing PDFs...")
-        coldpress_PDF = encode_from_histograms(PDF, zvector, packetsize=args.length, ini_quantiles=args.length-9,
-                                               validate=args.validate, tolerance=args.tolerance)
+        try:
+            coldpress_PDF = encode_from_histograms(PDF, zvector, packetsize=args.length, ini_quantiles=args.length-9,
+                                                   validate=args.validate, tolerance=args.tolerance)
+        except ValueError as e:
+            # Provide a user-friendly error message for library-level errors and exit
+            print(f"Error: {e}", file=sys.stderr)
+            print("Hint: Please check your input parameters, such as --length.", file=sys.stderr)
+            sys.exit(1)
 
         # Create the new column for the output
         nints = args.length // 4
@@ -176,6 +189,72 @@ def measure_logic(args):
     new_hdu.writeto(args.output, overwrite=True)
     print('Done.')
 
+# --- Logic for the 'plot' command ---
+def plot_logic(args):
+    """Logic to plot PDFs from compressed data."""
+    # This import is local to the function to avoid making matplotlib
+    # a hard dependency for users who only use encode/decode/measure.
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("Error: matplotlib is required for the plot command.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Opening input file: {args.input}")
+    with fits.open(args.input) as h:
+        data = h[1].data
+
+    qcold = data[args.pdfcol]
+
+    # Determine which sources to plot
+    if args.all:
+        indices_to_plot = range(len(data))
+        print(f"Plotting all {len(indices_to_plot)} sources...")
+    else:
+        if 'ID' not in data.columns.names:
+            print(f"Error: --id specified, but no 'ID' column found in {args.input}", file=sys.stderr)
+            sys.exit(1)
+        source_ids = list(args.id)
+        indices_to_plot = np.where(np.isin(data['ID'], source_ids))[0]
+        if len(indices_to_plot) != len(source_ids):
+            print("Warning: Some specified IDs were not found in the file.", file=sys.stderr)
+        print(f"Found {len(indices_to_plot)} of {len(source_ids)} specified IDs to plot.")
+
+    # Create output directory if it doesn't exist
+    os.makedirs(args.outdir, exist_ok=True)
+
+    for i in indices_to_plot:
+        source_id = data['ID'][i] if 'ID' in data.columns.names else f"row_{i}"
+        
+        if not np.any(qcold[i] != 0):
+            print(f"Skipping source {source_id}: No valid PDF data.")
+            continue
+
+        quantiles = decode_quantiles(qcold[i].tobytes())
+        
+        plt.figure(figsize=(8, 6))
+
+        if args.method == 'steps' or args.method == 'all':
+            z_steps, p_steps = reconstruct_pdf_from_quantiles(quantiles)
+            plt.step(z_steps[:-1], p_steps, where='post', label='steps')
+
+        if args.method == 'spline' or args.method == 'all':
+            zvector = np.linspace(quantiles[0],quantiles[-1],500)
+            pdf = cdf_to_pdf(quantiles, zvector=zvector, method='spline')
+            plt.plot(zvector, pdf, label='spline')            
+
+        plt.xlabel('Redshift (z)')
+        plt.ylabel('Probability Density P(z)')
+        plt.title(f'Reconstructed PDF for Source {source_id}')
+        plt.grid(True, alpha=0.4)
+        plt.legend()
+        plt.tight_layout()
+
+        output_filename = os.path.join(args.outdir, f"pdf_{source_id}.{args.format.lower()}")
+        plt.savefig(output_filename)
+        plt.close()
+        print(f"Saved plot to {output_filename}")
+
 # --- Main Entry Point and Parser Configuration ---
 def main():
     parser = argparse.ArgumentParser(
@@ -197,6 +276,7 @@ def main():
     parser_encode.add_argument('--validate', action='store_true', default=False, help='verify accuracy of recovered quantiles')
     parser_encode.add_argument('--tolerance', type=float, nargs='?', default=0.001, help='maximum shift in redshift allowed for quantiles')
     parser_encode.add_argument('--keep-orig', action='store_true', help='Keep the original PDF column in the output file.')
+
     parser_encode.set_defaults(func=encode_logic) # This links the 'encode' command to its function
 
     # --- Parser for the "decode" command ---
@@ -220,6 +300,23 @@ def main():
                                 help='name of column containing cold-pressed PDFs')
                                 
     parser_measure.set_defaults(func=measure_logic)
+
+    # --- Parser for the "plot" command ---
+    parser_plot = subparsers.add_parser('plot', help='Plot reconstructed PDFs from compressed data.')
+    parser_plot.add_argument('input', type=str, help='name of input FITS table containing compressed PDFs')
+    plot_group = parser_plot.add_mutually_exclusive_group(required=True)
+    plot_group.add_argument('--id', nargs='+', type=int, help='One or more source IDs to plot.')
+    plot_group.add_argument('--all', action='store_true', help='Plot PDFs for all sources in the file.')
+    parser_plot.add_argument('--pdfcol', type=str, nargs='?', default='coldpress_PDF',
+                                help='name of column containing cold-pressed PDFs')
+    parser_plot.add_argument('--outdir', type=str, default='.',
+                                help='Output directory for plot files (default: current directory)')
+    parser_plot.add_argument('--format', type=str, default='png',
+                                help='Output format for plots (e.g., png, pdf, jpg; default: png)')
+    parser_plot.add_argument('--method', type=str, default='linear', choices=['steps', 'spline', 'all'],
+                                help='PDF reconstruction method for plotting (default: all)')
+
+    parser_plot.set_defaults(func=plot_logic)
 
     # Parse the arguments and call the function that was set by set_defaults
     args = parser.parse_args()
