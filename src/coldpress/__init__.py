@@ -44,12 +44,9 @@ __all__ = [
 import numpy as np
 import struct
 import sys
-
-# Make scipy an optional import for non-plotting functions
-try:
-    from scipy.interpolate import CubicSpline
-except ImportError:
-    CubicSpline = None
+from scipy.interpolate import CubicSpline, PchipInterpolator
+from scipy.integrate import quad
+from numpy.polynomial.legendre import leggauss
 
 
 def pdf_to_cdf(z_grid, Pz, Nquantiles=100):
@@ -88,7 +85,7 @@ def pdf_to_cdf(z_grid, Pz, Nquantiles=100):
     
     return qs
     
-def cdf_to_pdf(z_quantiles, dz=None, z_min=None, z_max=None, zvector=None):
+def cdf_to_pdf(z_quantiles, dz=None, z_min=None, z_max=None, zvector=None, method='linear'):
     """
     Given quantile locations z_quantiles (monotonic array of length M),
     where CDF F(z_quantiles[j]) = j/(M-1),
@@ -129,9 +126,22 @@ def cdf_to_pdf(z_quantiles, dz=None, z_min=None, z_max=None, zvector=None):
 
     # 1) Interpolate the CDF onto the regular grid
     #    Values outside [zq[0], zq[-1]] are clamped to 0 or 1
-    F_grid = np.interp(edges, zq, Fq, left=0.0, right=1.0)
-    
+    if method == 'linear':
+        F_grid = np.interp(edges, zq, Fq, left=0.0, right=1.0)
+    if method == 'spline':
+        F_grid = np.zeros(len(edges))
+        F_grid[edges < zq[0]] = 0.
+        F_grid[edges > zq[-1]] = 1.
+        inside = (edges >= zq[0]) & (edges <= zq[-1])
+        F_inside = monotone_natural_spline(edges[inside], zq, Fq)
+        F_grid[inside] = F_inside/F_inside[-1] # numerical errors in integration make F_inside[-1] not exactly 1 
     pdf = F_grid[1:] - F_grid[:-1]
+    
+#     if np.min(pdf) < 0:
+#         import code
+#         code.interact(local=locals())
+    
+    pdf /= np.sum(pdf*dz)
         
     if zvector is not None:
         return pdf
@@ -470,76 +480,54 @@ def reconstruct_pdf_from_quantiles(quantiles):
     Nq = len(quantiles)
     p_steps = (1.0 / (Nq - 1)) / (quantiles[1:] - quantiles[:-1])
     z_steps = quantiles
-    return z_steps, p_steps
-
-def reconstruct_pdf_variational(quantiles, n_points=500, densify_threshold_factor=5.0, pad_factor=0.1):
+    z_steps_extended = np.concatenate(([z_steps[0]-0.001],z_steps,[z_steps[-1]+0.001]))
+    p_steps_extended = np.concatenate(([0],p_steps,[0]))
+    return z_steps_extended, p_steps_extended
+    
+def monotone_natural_spline(Xout, X, Y):
     """
-    Reconstructs a smooth PDF using a "guided" variational approach.
-
-    This method creates a smooth, physically-plausible PDF by:
-    1. Padding the boundaries to enforce a PDF of zero outside the data range.
-    2. Densifying large gaps between quantiles with linear guide points.
-    3. Fitting a minimum-curvature (natural cubic) spline to the guided points.
-
+    Interpolate (X, Y) with a natural cubic spline, then correct any
+    non-monotonic intervals using PCHIP interpolation.
+    
+    Parameters
+    ----------
+    X : array_like, shape (N,)
+        Strictly increasing abscissas of the knots.
+    Y : array_like, shape (N,)
+        Ordinates of the knots.
+    Xout : array_like
+        Points at which to evaluate the corrected monotone spline.
+    
     Returns
     -------
-    z_fine : ndarray
-        A fine grid of redshift values for plotting.
-    pdf_fine : ndarray
-        The smooth probability density values on the z_fine grid.
-    is_monotonic : bool
-        True if the resulting PDF is non-negative everywhere, False otherwise.
+    Yout : ndarray
+        Interpolated values at Xout, guaranteed monotonic on each segment.
     """
-    if CubicSpline is None:
-        raise ImportError("scipy is required for the variational plotting method.")
-
-    # --- Step 1: Boundary Padding ---
-    z_coords = list(quantiles)
-    cdf_coords = list(np.linspace(0.0, 1.0, len(quantiles)))
-
-    # Pad the beginning to enforce zero slope
-    start_epsilon = pad_factor * (z_coords[1] - z_coords[0])
-    z_coords.insert(0, z_coords[0] - start_epsilon)
-    cdf_coords.insert(0, 0.0)
-
-    # Pad the end to enforce zero slope
-    end_epsilon = pad_factor * (z_coords[-1] - z_coords[-2])
-    z_coords.append(z_coords[-1] + end_epsilon)
-    cdf_coords.append(1.0)
-
-    # --- Step 2: Densification ---
-    z_dense = []
-    cdf_dense = []
+    # Fit natural and PCHIP splines
+    spline = CubicSpline(X, Y, bc_type='natural')
+    pchip = PchipInterpolator(X, Y)
     
-    dz = np.diff(z_coords)
-    # Use a robust threshold; ignore zero-width gaps if any
-    median_dz = np.median(dz[dz > 0])
-    if median_dz == 0: # Handle case of all quantiles being the same
-        median_dz = 1e-9
-    threshold = densify_threshold_factor * median_dz
-
-    for i in range(len(z_coords) - 1):
-        z_dense.append(z_coords[i])
-        cdf_dense.append(cdf_coords[i])
-        gap = z_coords[i+1] - z_coords[i]
-        if gap > threshold:
-            # Add a guide point in the middle of large gaps
-            z_mid = (z_coords[i] + z_coords[i+1]) / 2.0
-            cdf_mid = (cdf_coords[i] + cdf_coords[i+1]) / 2.0
-            z_dense.append(z_mid)
-            cdf_dense.append(cdf_mid)
+    # natural is the default interpolation
+    Yout = spline(Xout)
     
-    z_dense.append(z_coords[-1])
-    cdf_dense.append(cdf_coords[-1])
-
-    # --- Step 3: Minimum-Energy Spline Fitting ---
-    cdf_spline = CubicSpline(z_dense, cdf_dense, bc_type='natural')
-
-    # --- Step 4: Differentiation and Verification ---
-    z_fine = np.linspace(quantiles[0], quantiles[-1], n_points)
-    pdf_fine = cdf_spline(z_fine, nu=1)
-
-    is_monotonic = np.all(pdf_fine >= -1e-9)
+    # Compute first derivative at knots and in the output grid
+    Yp  = spline(X, 1)
+    Ypp = spline(X, 2)
+    dYout = spline(Xout, 1)
+        
+    # Determine which interval each Xout belongs to
+    idx = np.searchsorted(X, Xout) - 1
+    idx = np.clip(idx, 0, len(X)-2)
     
-    # Return the PDF, but do not clip to zero. Let the caller decide.
-    return z_fine, pdf_fine, is_monotonic
+    # Check monotonicity and switch to PCHIP if violated
+    for i in range(len(X)-1):
+        # intervals with negative slope OR non-positive knot slopes
+        mask = (idx == i) & ((dYout < 0) | (Yp[i] <= 0) | (Yp[i+1] <= 0))
+        if np.any(mask):
+            mask = (idx == i)
+            Yout[mask] = pchip(Xout[mask]) # intermediate quantile, use PCHIP
+             
+    return Yout
+    
+
+  

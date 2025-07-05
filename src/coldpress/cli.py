@@ -18,8 +18,7 @@ from . import (
     zmean_err_from_quantiles,
     odds_from_quantiles,
     HPDCI_from_quantiles,
-    reconstruct_pdf_from_quantiles,
-    reconstruct_pdf_variational)
+    reconstruct_pdf_from_quantiles)
 
 # --- Logic for the 'encode' command ---
 def encode_logic(args):
@@ -196,17 +195,7 @@ def plot_logic(args):
         import matplotlib.pyplot as plt
     except ImportError:
         print("Error: matplotlib is required for the plot command.", file=sys.stderr)
-        print("Hint: Please install it with 'pip install matplotlib'", file=sys.stderr)
         sys.exit(1)
-
-    # Check for scipy if a spline method is requested
-    if args.method == 'variational':
-        try:
-            from scipy.interpolate import CubicSpline
-        except ImportError:
-            print("Error: scipy is required for the 'variational' plotting method.", file=sys.stderr)
-            print("Hint: Please install it with 'pip install scipy'", file=sys.stderr)
-            sys.exit(1)
 
     print(f"Opening input file: {args.input}")
     with fits.open(args.input) as h:
@@ -242,19 +231,14 @@ def plot_logic(args):
         
         plt.figure(figsize=(8, 6))
 
-        # Plot the main requested method
-        if args.method == 'variational':
-            z_fine, pdf_fine, is_mono = reconstruct_pdf_variational(quantiles)
-            status = "Monotonic" if is_mono else "NON-MONOTONIC"
-            plt.plot(z_fine, pdf_fine, label=f'Variational PDF (Status: {status})')
-        else: # 'step' method
+        if args.method == 'steps' or args.method == 'all':
             z_steps, p_steps = reconstruct_pdf_from_quantiles(quantiles)
-            plt.step(z_steps[:-1], p_steps, where='post', label='Step PDF')
+            plt.step(z_steps[:-1], p_steps, where='post', label='steps')
 
-        # For the variational plot, also show the step function for comparison
-        if args.method == 'variational':
-            z_steps, p_steps = reconstruct_pdf_from_quantiles(quantiles)
-            plt.step(z_steps[:-1], p_steps, where='post', label='Step PDF (for comparison)', alpha=0.4, linestyle='--')
+        if args.method == 'spline' or args.method == 'all':
+            zvector = np.linspace(quantiles[0],quantiles[-1],500)
+            pdf = cdf_to_pdf(quantiles, zvector=zvector, method='spline')
+            plt.plot(zvector, pdf, label='spline')            
 
         plt.xlabel('Redshift (z)')
         plt.ylabel('Probability Density P(z)')
@@ -326,8 +310,8 @@ def main():
                                 help='Output directory for plot files (default: current directory)')
     parser_plot.add_argument('--format', type=str, default='png',
                                 help='Output format for plots (e.g., png, pdf, jpg; default: png)')
-    parser_plot.add_argument('--method', type=str, default='variational', choices=['step', 'variational'],
-                                help='PDF reconstruction method for plotting (default: variational)')
+    parser_plot.add_argument('--method', type=str, default='linear', choices=['steps', 'spline', 'all'],
+                                help='PDF reconstruction method for plotting (default: all)')
 
     parser_plot.set_defaults(func=plot_logic)
 
