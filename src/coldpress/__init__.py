@@ -23,11 +23,13 @@ __license__ = "GPLv3"
 __copyright__ = "Copyright 2025, Antonio Hernán Caballero"
 
 __all__ = [
+    'samples_to_cdf',
     'pdf_to_cdf',
     'cdf_to_pdf',
     'encode_quantiles',
     'decode_quantiles',
     'encode_from_histograms',
+    'encode_from_samples',
     'decode_to_histograms',
     'decode_to_cdf',
     'zmode_from_quantiles',
@@ -37,20 +39,26 @@ __all__ = [
     'zrandom_from_quantiles',
     'odds_from_quantiles',
     'HPDCI_from_quantiles',
-    'reconstruct_pdf_from_quantiles',
-    'reconstruct_pdf_variational',
+    'reconstruct_pdf_from_quantiles'
 ]
 
 import numpy as np
 import struct
 import sys
 from scipy.interpolate import CubicSpline, PchipInterpolator
-from scipy.integrate import quad
-from numpy.polynomial.legendre import leggauss
+#from scipy.integrate import quad
+#from numpy.polynomial.legendre import leggauss
+
+def samples_to_cdf(samples, Nquantiles=100):
+    """ obtain a cumulative PDF by quantiles from random samples of the underlying PDF"""
+    valid = np.isfinite(samples)
+    zsorted = np.sort(samples[valid])
+    targets = np.linspace(0.0, 1.0, Nquantiles) # target probability for quantiles
+    return np.quantiles(zsorted, targets, method='linear')
 
 
 def pdf_to_cdf(z_grid, Pz, Nquantiles=100):
-    """ obtain a cumulative PDF by quantiles from a PDF """
+    """ obtain a cumulative PDF by quantiles from a binned PDF (histogram)"""
 
     nonzero = np.where(Pz > 0)[0]
        
@@ -136,11 +144,7 @@ def cdf_to_pdf(z_quantiles, dz=None, z_min=None, z_max=None, zvector=None, metho
         F_inside = monotone_natural_spline(edges[inside], zq, Fq)
         F_grid[inside] = F_inside/F_inside[-1] # numerical errors in integration make F_inside[-1] not exactly 1 
     pdf = F_grid[1:] - F_grid[:-1]
-    
-#     if np.min(pdf) < 0:
-#         import code
-#         code.interact(local=locals())
-    
+        
     pdf /= np.sum(pdf*dz)
         
     if zvector is not None:
@@ -191,7 +195,7 @@ def encode_quantiles(quantiles, packetsize=80, validate=True, tolerance=0.001):
     
     # check if eps_min is too large to encode in one byte
     if eps_min > 0.00255:
-        raise ValueError('Error: epsilon value is too large. Need to increase packet length or decrease number of quantiles.')
+        raise ValueError('Error: minimum usable epsilon={eps_min} is too large. Increase packet length or decrease number of quantiles.')
 
     # find the minimum value of epsilon that we would need to encode the largest gap in two bytes
     eps_min2 = 0.00001*np.ceil(100000*gaps[-1]/(256**2 -1))
@@ -200,9 +204,7 @@ def encode_quantiles(quantiles, packetsize=80, validate=True, tolerance=0.001):
     eps = np.max([0.00001,eps_min,eps_min2])    
 
     if int(np.round(eps*100000)) > 255:
-        print('Error: epsilon value is too large, but it was not catched before!')
-        import code
-        code.interact(local=locals())
+        raise ValueError(f'Error: epsilon={eps} is too large for 1 byte encoding.')
 
     # build payload from the *interior* N-2 quantiles
     payload = bytearray()
@@ -218,7 +220,7 @@ def encode_quantiles(quantiles, packetsize=80, validate=True, tolerance=0.001):
 
     L = len(payload)
     if L > packetsize-5: 
-        raise ValueError('Error: payload is too long. Decrease number of quantiles.')
+        raise ValueError(f'Error: payload of length {L} does not fit in packet of size {packetsize}.')
         
     packet = bytearray(packetsize)
     packet[0] = int(np.round(eps*100000))
@@ -226,12 +228,14 @@ def encode_quantiles(quantiles, packetsize=80, validate=True, tolerance=0.001):
     packet[3:5] = struct.pack('<H', xmax_int)
     packet[5:5+L] = payload
     
-    if validate: # verify that the packet decodes correctly to the original quantiles 
+    if validate: 
+        # verify that the packet decodes correctly to the original number of quantiles 
         qrecovered = decode_quantiles(packet)
         if len(qrecovered) != len(quantiles):
             raise ValueError('Error: packet decodes to wrong number of quantiles.')
-        diff = quantiles-qrecovered
-        if max(abs(diff)) > tolerance:
+        # verify that the shift in quantile redshifts is within tolerance (excluding first and last quantiles)
+        shift = quantiles[1:-1]-qrecovered[1:-1]
+        if max(abs(shift)) > tolerance:
             raise ValueError('Error: shift in quantiles exceeds tolerance.')
         
     return L, bytes(packet)
@@ -269,75 +273,113 @@ def decode_quantiles(packet):
     zs.append(zmax)
     return np.array(zs)
     
-def encode_from_histograms(PDF, zvector, ini_quantiles=71, packetsize=80, tolerance=None, validate=None, debug=False):
+def batch_encode(data, ini_quantiles=71, packetsize=80, tolerance=None, validate=None, debug=False):
     """
-    Encode the PDFs given by the arrays PDF and zvector as a packet of bytes
-    containing a compressed representation of the quantiles of the cumulative
-    distribution function.
-    """
+    This function handles the batch encoding of multiple PDFs. Accepted input formats are:
+     - PDF histograms
+     - redshift samples 
+    The data dictionary must contain the keywords:
+      - format: type of PDF: 'PDF_histogram' or 'samples'
+      - the data itself (PDF and zvector arrays for 'PDF_histogram', z samples array for 'samples') 
+    """    
     if packetsize % 4 != 0:
         raise ValueError(f"Error: packetsize must be a multiple of 4, but got {packetsize}.")
 
     if packetsize - ini_quantiles < 3:
         raise ValueError('Error: ini_quantiles must be at most packetsize-3')
         
-    Nsources = PDF.shape[0]
-    int32col = np.zeros((Nsources,packetsize//4),dtype='>i4') # each 4 bytes will be encoded as a 32-bit signed integer (big-endian)
+    # filter out invalid PDFs. Their encoded representation will be all zeros.
+    if data['format'] == 'PDF_histogram':
+        valid = np.sum(data['PDF'],axis=1) > 0
+    if data['format'] == 'samples':
+        valid = np.isfinite(data['samples'],axis=1)
+            
+    # prepare array to contain encoded PDFs        
+    int32col = np.zeros((len(valid),packetsize//4),dtype='>i4') # each 4 bytes will be encoded as a 32-bit signed integer (big-endian)
+      
+    # iterate sources    
+    for i in range(len(valid)):
+        if not valid[i]:
+            continue
     
-    for i in range(Nsources):
-        if np.sum(PDF[i]) > 0: 
-            Nquantiles = ini_quantiles
-            lastgood = None
-            trycount = 0
-            while True:
-                if debug:
-                    trycount += 1
-                    if trycount > 10:
-                        print('We got stuck in infinite loop.')
-                        import code
-                        code.interact(local=locals())
+        # initialize loop for selection of optimal number of quantiles
+        Nquantiles = ini_quantiles
+        lastgood = None
+        while True:
+            if debug:
+                trycount += 1
+                if trycount > 10:
+                    print('We got stuck in infinite loop.')
+                    import code
+                    code.interact(local=locals())
+                print(f'Trying: {Nquantiles} quantiles')
+            
+            # get quantiles for current value of Nquantiles
+            if data['format'] == 'PDF_histogram':    
+                quantiles = pdf_to_cdf(data['zvector'],data['PDF'][i],Nquantiles=Nquantiles) # compute quantiles from PDZ
+            if data['format'] == 'samples':
+                quantiles = samples_to_cdf(data['samples'][i],Nquantiles=Nquantiles) # compute quantiles from samples
                     
-                    print(f'Trying: {Nquantiles} quantiles')
-                quantiles = pdf_to_cdf(zvector,PDF[i],Nquantiles=Nquantiles) # compute quantiles from PDZ
-                try:
-                    payload_length, packet = encode_quantiles(quantiles,packetsize=packetsize,tolerance=tolerance,validate=validate) # encode quantiles as byte array                     
-                except ValueError as e:
-                    if lastgood is not None: # we already tried with fewer quantiles and it worked. We are done.
-                        if debug:
-                            print('Warning: we tried to increase number of quantiles and it didnt work. We are good with previous solution.')
-                        packet = lastgood
-                        break
-                    else: # lets try decreasing number of quantiles  
-                        if debug:  
-                            msg = str(e)
-                            if 'tolerance' in msg:
-                                print('Warning: some quantile shifted beyond tolerance. Retrying with fewer quantiles...')
-                            if 'epsilon' in msg:
-                                print(f'Warning: epsilon is too large with {Nquantiles}. Retrying with fewer quantiles...')
-                            if 'payload is too long' in msg:
-                                print(f'Warning: payload too long with {Nquantiles}. Retrying with fewer quantiles...')    
-                        Nquantiles -= 2
-                        continue    
-                    
-                if payload_length < packetsize-5: # try again with more quantiles
-                    lastgood = packet
-                    Nquantiles += 2
+            # encode and validate results    
+            try:
+                payload_length, packet = encode_quantiles(quantiles,packetsize=packetsize,tolerance=tolerance,validate=validate) # encode quantiles as byte array                     
+            except ValueError as e:
+                if lastgood is not None: # we already tried with fewer quantiles and it worked. We are done.
                     if debug:
-                        print('Warning: there are trailing zeros in packet. Trying to squeeze more quantiles...')
-                    continue
-                        
-                if payload_length == packetsize-5: # payload completely fills the packet, we are done
-                    if debug:
-                        print('Warning: payload is full. we are good!')
+                        print('Warning: we tried to increase number of quantiles and it didnt work. We are good with previous solution.')
+                    packet = lastgood
                     break
-             
-            int32col[i] = np.frombuffer(packet, dtype='>i4')
+                else: # lets try decreasing number of quantiles  
+                    if debug:  
+                        msg = str(e)
+                        if 'tolerance' in msg:
+                            print('Warning: some quantile shifted beyond tolerance. Retrying with fewer quantiles...')
+                        if 'epsilon' in msg:
+                            print(f'Warning: epsilon is too large with {Nquantiles}. Retrying with fewer quantiles...')
+                        if 'payload of length' in msg:
+                            print(f'Warning: payload too long with {Nquantiles}. Retrying with fewer quantiles...')    
+                    Nquantiles -= 2
+                    continue    
+                
+            if payload_length < packetsize-5: # try again with more quantiles
+                lastgood = packet
+                Nquantiles += 2
+                if debug:
+                    print('Warning: there are trailing zeros in packet. Trying to squeeze more quantiles...')
+                continue
+                    
+            if payload_length == packetsize-5: # payload completely fills the packet, we are done
+                if debug:
+                    print('Warning: payload is full. we are good!')
+                break
+         
+        int32col[i] = np.frombuffer(packet, dtype='>i4')
 
     return int32col
+ 
+    
+def encode_from_histograms(PDF, zvector, ini_quantiles=71, packetsize=80, tolerance=None, validate=None, debug=False):
+    """
+    Encode the PDFs given by the arrays PDF and zvector as a packet of bytes
+    containing a compressed representation of the quantiles of the cumulative
+    distribution function.
+    """
+    data = {'format': 'PDF_histogram', 'zvector': zvector, 'PDF': PDF}    
+    return batch_encode(data, ini_quantiles=ini_quantiles, packetsize=packetsize, tolerance=tolerance, validate=validate, debug=debug)
+ 
+def encode_from_samples(samples, ini_quantiles=71, packetsize=80, tolerance=None, validate=None, debug=False):
+    """
+    Encode as quantiles the PDFs given as an array individual random redshift samples taken from the underlying PDF.
+    """   
+    data = {'format': 'samples', 'samples': samples}
+    return batch_encode(data, ini_quantiles=ini_quantiles, packetsize=packetsize, tolerance=tolerance, validate=validate, debug=debug)     
 
 def decode_to_histograms(int32col, zvector, force_range=False):
     """
-    Decode the PDFs that have been encoded with the encode_from_histograms() method
+    Decode the PDFs to a histogram PDF with bins defined by zvector.
+    In the case of P(z) > 0 outside the range defined by zvector, an exception is raised.
+    Set force_range = True if you prefer to truncate the PDF instead of raising an
+    exception.
     """
     Nsources = int32col.shape[0]
     PDF = np.zeros((Nsources,len(zvector)),dtype=np.float32)
@@ -418,13 +460,13 @@ def zrandom_from_quantiles(quantiles):
     knots = np.linspace(0, 1, len(quantiles))
     return np.interp(u, knots, quantiles)
 
-def odds_from_quantiles(quantiles, zbest, zwidth=0.03):
+def odds_from_quantiles(quantiles, zcenter, odds_window=0.03):
     """Obtain the odds parameter defined as the integral of P(z) in the interval
-       zbest +/- zwidth(1+zbest), where zbest could be zmode, zmean, zmedian, etc
+       zcenter +/- odds_window*(1+zcenter), where zcenter could be zmode, zmean, zmedian, etc
     """
     knots = np.linspace(0, 1, len(quantiles))
-    zbinmin = zbest - zwidth*(1+zbest)
-    zbinmax = zbest + zwidth*(1+zbest)
+    zbinmin = zcenter - odds_window*(1+zcenter)
+    zbinmax = zcenter + odds_window*(1+zcenter)
     qz = np.interp([zbinmin,zbinmax],quantiles,knots,left=0,right=1)
     return qz[1]-qz[0]
 

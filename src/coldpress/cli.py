@@ -23,6 +23,7 @@ from . import (
 
 # --- Logic for the 'encode' command ---
 def encode_logic(args):
+    import time
     """Contains all the logic from the original coldpress_encode.py script."""
     if args.length % 4 != 0:
         print(f"Error: Packet length (--length) must be a multiple of 4, but got {args.length}.", file=sys.stderr)
@@ -34,36 +35,48 @@ def encode_logic(args):
     with fits.open(args.input) as h:
         # Get the header and all necessary columns while the file is open
         header = h[1].header
-        PDF = h[1].data[args.pdfcol]
+        if args.binned is None:
+            samples = h[1].data[args.samples]
+            print(f"Generating quantiles from random redshift samples and compressing into {args.length}-byte packets...")
+        else:
+            PDF = h[1].data[args.binned]
+            zvector = np.linspace(args.zmin, args.zmax, PDF.shape[1])
+            cratio = PDF.shape[1]*PDF.itemsize/args.length
+            print(f"Compressing PDFs into {args.length}-byte packets (compression ratio: {cratio:.2f})...")
+
         orig_cols = list(h[1].columns)
 
-        # Now, perform all the processing that depends on the input data
-        zvector = np.linspace(args.zmin, args.zmax, PDF.shape[1])
-
-        print("Compressing PDFs...")
-        try:
+        # Now, perform all the processing that depends on the input data        
+        start = time.process_time()
+        if args.binned is None:
+            coldpress_PDF = encode_from_samples(samples, packetsize=args.length, ini_quantiles=args.length-9,
+                                                   validate=args.validate, tolerance=args.tolerance)        
+        else:
             coldpress_PDF = encode_from_histograms(PDF, zvector, packetsize=args.length, ini_quantiles=args.length-9,
                                                    validate=args.validate, tolerance=args.tolerance)
-        except ValueError as e:
-            # Provide a user-friendly error message for library-level errors and exit
-            print(f"Error: {e}", file=sys.stderr)
-            print("Hint: Please check your input parameters, such as --length.", file=sys.stderr)
-            sys.exit(1)
+        end = time.process_time()
+        cpu_seconds = end - start
+        print(f"{coldpress_PDF.shape[0]} PDFs cold-pressed in {cpu_seconds:.6f} CPU seconds")
 
         # Create the new column for the output
         nints = args.length // 4
-        new_col = fits.Column(name=args.out_pdfcol, format=f'{nints}J', array=coldpress_PDF)
+        new_col = fits.Column(name=args.out_encoded, format=f'{nints}J', array=coldpress_PDF)
 
         # Manipulate the list of columns
         # First, remove the output column if it already exists to prevent duplicates
-        final_cols = [c for c in orig_cols if c.name != args.out_pdfcol]
+        final_cols = [c for c in orig_cols if c.name != args.out_encoded]
 
         # Conditionally remove the original PDF column if --keep-orig is NOT set
-        if not args.keep_orig:
-            print(f"Removing original PDF column: '{args.pdfcol}'")
-            final_cols = [c for c in final_cols if c.name != args.pdfcol]
+        if args.binned is None:
+            orig_column = args.samples
         else:
-            print(f"Keeping original PDF column: '{args.pdfcol}'")
+            orig_column = args.binned  
+              
+        if args.keep_orig:
+            print(f"Including column '{orig_column}' in output FITS table.")
+        else:
+            final_cols = [c for c in final_cols if c.name != orig_column]
+            print(f"Excluding column '{orig_column}' from output FITS table.")
 
         # Add the new compressed column to the final list
         final_cols.append(new_col)
@@ -73,7 +86,10 @@ def encode_logic(args):
         new_hdu = fits.BinTableHDU.from_columns(final_cols, header=header)
 
     # Add history and write the new HDU to the output file
-    new_hdu.header.add_history(f'PDFs in column {args.pdfcol} cold-pressed as {args.out_pdfcol}')
+    if args.binned is None:
+        new_hdu.header.add_history(f'PDFs from samples in column {args.samples} cold-pressed as {args.out_encoded}')
+    else:       
+        new_hdu.header.add_history(f'Binned PDFs in column {args.binned} cold-pressed as {args.out_encoded}')
     print(f"Writing compressed data to: {args.output}")
     new_hdu.writeto(args.output, overwrite=True)
     print('Done.')
@@ -88,7 +104,7 @@ def decode_logic(args):
     with fits.open(args.input) as h:
         # Get all necessary data and metadata from the input file
         header = h[1].header
-        coldpress_PDF = h[1].data[args.pdfcol]
+        coldpress_PDF = h[1].data[args.encoded]
         orig_cols = list(h[1].columns)
 
         # Define the z-axis for the output PDF
@@ -106,17 +122,17 @@ def decode_logic(args):
             sys.exit(1)
 
         # Create the new FITS column for the decompressed data
-        new_col = fits.Column(name=args.out_pdfcol, format=f'{zvsize}E', array=decoded_PDF)
+        new_col = fits.Column(name=args.out_binned, format=f'{zvsize}E', array=decoded_PDF)
 
         # Manipulate the list of columns
-        final_cols = [c for c in orig_cols if c.name != args.out_pdfcol]
+        final_cols = [c for c in orig_cols if c.name != args.out_binned]
         final_cols.append(new_col)
 
         # Build the new HDU. This now works because the input file is still open.
         new_hdu = fits.BinTableHDU.from_columns(final_cols, header=header)
     
     # Add history and write the new HDU to the output file
-    new_hdu.header.add_history(f'PDZs in column {args.pdfcol} extracted as {args.out_pdfcol}')
+    new_hdu.header.add_history(f'PDFs in column {args.encoded} extracted as {args.out_binned}')
     print(f"Writing decompressed data to: {args.output}")
     new_hdu.writeto(args.output, overwrite=True)
     print('Done.')
@@ -130,42 +146,95 @@ def measure_logic(args):
         header = h[1].header
         original_columns = data.columns
 
-    qcold = data[args.pdfcol]
+    qcold = data[args.encoded]
     Nsources = qcold.shape[0]
 
-    # Initialize dictionaries to hold new columns
+    # --- New logic for --quantities argument ---
+
+    # Define all possible quantities and their dependencies.
+    # FITS column names are case-insensitive, but we'll use uppercase for consistency.
+    all_quantities = {
+        'Z_MODE', 'Z_MEAN', 'Z_MEDIAN', 'Z_RANDOM', 'Z_MODE_ERR', 'Z_MEAN_ERR',
+        'ODDS_MODE', 'ODDS_MEAN', 'Z_MIN_HPDCI68', 'Z_MAX_HPDCI68',
+        'Z_MIN_HPDCI95', 'Z_MAX_HPDCI95'
+    }
+    dependencies = {
+        'Z_MODE_ERR': ['Z_MODE'],
+        'ODDS_MODE': ['Z_MODE'],
+        'ODDS_MEAN': ['Z_MEAN']
+    }
+
+    # Determine which quantities to compute based on user input
+    requested_q = {q.upper() for q in args.quantities}
+
+    if 'ALL' in requested_q:
+        q_to_compute = all_quantities
+    else:
+        # Validate that all requested quantities are known
+        unknown_q = requested_q - all_quantities
+        if unknown_q:
+            print(f"Error: Unknown quantities specified: {', '.join(unknown_q)}", file=sys.stderr)
+            print(f"Available quantities: {', '.join(sorted(list(all_quantities)))}", file=sys.stderr)
+            sys.exit(1)
+        q_to_compute = requested_q
+
+    # Determine the full set of internal calculations needed, including dependencies
+    internal_calcs = set(q_to_compute)
+    for q in q_to_compute:
+        if q in dependencies:
+            internal_calcs.update(dependencies[q])
+    
+    print(f"Will compute: {', '.join(sorted(list(q_to_compute)))}")
+
+    # Initialize dictionaries to hold new columns only for requested quantities
     d = {}
-    for k in ['Z_MODE','Z_MEAN','Z_MEDIAN',
-              'Z_MODE_ERR','Z_MEAN_ERR',
-              'Z_RANDOM',
-              'Z_MIN_HPDCI68','Z_MAX_HPDCI68',
-              'Z_MIN_HPDCI95','Z_MAX_HPDCI95',
-              'ODDS_MODE','ODDS_MEAN']:
-        d[k] = np.full(Nsources, np.nan, dtype=np.float32)
-    d['Z_FLAGS'] = np.zeros(Nsources, dtype=np.int16)
+    for q_name in q_to_compute:
+        d[q_name] = np.full(Nsources, np.nan, dtype=np.float32)
 
     valid = np.any(qcold != 0, axis=1)
-    d['Z_FLAGS'][~valid] = 1024 # Flag for no PDF info
+               
+#    d['Z_FLAGS'] = np.zeros(Nsources, dtype=np.int16)
+#    d['Z_FLAGS'][~valid] = 1024 # Flag for no PDF info
 
     valid_indices = np.where(valid)[0]
     print(f"Calculating point estimates for {len(valid_indices)} valid sources...")
+    
     for i in valid_indices:
         quantiles = decode_quantiles(qcold[i].tobytes())
-        d['Z_MODE'][i] = zmode_from_quantiles(quantiles, width=0.005)
-        d['Z_MEAN'][i] = zmean_from_quantiles(quantiles)
-        d['Z_MEDIAN'][i] = zmedian_from_quantiles(quantiles)
-        d['Z_RANDOM'][i] = zrandom_from_quantiles(quantiles)
-        d['ODDS_MODE'][i] = odds_from_quantiles(quantiles, d['Z_MODE'][i])
-        d['ODDS_MEAN'][i] = odds_from_quantiles(quantiles, d['Z_MEAN'][i])
-        HPDCI68_mode_zmin, HPDCI68_mode_zmax = HPDCI_from_quantiles(quantiles, conf=0.68, zinside=d['Z_MODE'][i])
-        d['Z_MODE_ERR'][i] = 0.5 * (HPDCI68_mode_zmax - HPDCI68_mode_zmin)
-        d['Z_MEAN_ERR'][i] = zmean_err_from_quantiles(quantiles)
-        HPDCI68_zmin, HPDCI68_zmax = HPDCI_from_quantiles(quantiles, conf=0.68, zinside=None)
-        HPDCI95_zmin, HPDCI95_zmax = HPDCI_from_quantiles(quantiles, conf=0.95, zinside=None)
-        d['Z_MIN_HPDCI68'][i] = HPDCI68_zmin
-        d['Z_MAX_HPDCI68'][i] = HPDCI68_zmax
-        d['Z_MIN_HPDCI95'][i] = HPDCI95_zmin
-        d['Z_MAX_HPDCI95'][i] = HPDCI95_zmax
+        temp_results = {} # To store intermediate calculations for this source
+
+        # --- Perform internal calculations ---
+        # The order matters for dependencies.
+        if 'Z_MODE' in internal_calcs:
+            temp_results['Z_MODE'] = zmode_from_quantiles(quantiles, width=0.005)
+        if 'Z_MEAN' in internal_calcs:
+            temp_results['Z_MEAN'] = zmean_from_quantiles(quantiles)
+        if 'Z_MEDIAN' in internal_calcs:
+            temp_results['Z_MEDIAN'] = zmedian_from_quantiles(quantiles)
+        if 'Z_RANDOM' in internal_calcs:
+            temp_results['Z_RANDOM'] = zrandom_from_quantiles(quantiles)
+        if 'Z_MEAN_ERR' in internal_calcs:
+            temp_results['Z_MEAN_ERR'] = zmean_err_from_quantiles(quantiles)
+        if 'ODDS_MODE' in internal_calcs:
+            temp_results['ODDS_MODE'] = odds_from_quantiles(quantiles, temp_results['Z_MODE'], odds_window=args.odds_window)
+        if 'ODDS_MEAN' in internal_calcs:
+            temp_results['ODDS_MEAN'] = odds_from_quantiles(quantiles, temp_results['Z_MEAN'], odds_window=args.odds_window)
+        if 'Z_MODE_ERR' in internal_calcs:
+            HPDCI68_mode_zmin, HPDCI68_mode_zmax = HPDCI_from_quantiles(quantiles, conf=0.68, zinside=temp_results['Z_MODE'])
+            temp_results['Z_MODE_ERR'] = 0.5 * (HPDCI68_mode_zmax - HPDCI68_mode_zmin)
+        if 'Z_MIN_HPDCI68' in internal_calcs or 'Z_MAX_HPDCI68' in internal_calcs:
+            HPDCI68_zmin, HPDCI68_zmax = HPDCI_from_quantiles(quantiles, conf=0.68, zinside=None)
+            temp_results['Z_MIN_HPDCI68'] = HPDCI68_zmin
+            temp_results['Z_MAX_HPDCI68'] = HPDCI68_zmax
+        if 'Z_MIN_HPDCI95' in internal_calcs or 'Z_MAX_HPDCI95' in internal_calcs:
+            HPDCI95_zmin, HPDCI95_zmax = HPDCI_from_quantiles(quantiles, conf=0.95, zinside=None)
+            temp_results['Z_MIN_HPDCI95'] = HPDCI95_zmin
+            temp_results['Z_MAX_HPDCI95'] = HPDCI95_zmax
+
+        # --- Assign computed values to the final arrays ---
+        for q_name in q_to_compute:
+            if q_name in temp_results:
+                d[q_name][i] = temp_results[q_name]
 
     # Create a list of all columns for the new table, starting with original ones
     final_cols = []
@@ -184,7 +253,7 @@ def measure_logic(args):
         final_cols.append(fits.Column(name=name, format=format_str, array=array))
 
     new_hdu = fits.BinTableHDU.from_columns(final_cols, header=header)
-    new_hdu.header['HISTORY'] = f'Computed point estimates from column: {args.pdfcol}'
+    new_hdu.header['HISTORY'] = f'Computed point estimates from column: {args.encoded}'
     print(f"Writing point estimates to: {args.output}")
     new_hdu.writeto(args.output, overwrite=True)
     print('Done.')
@@ -266,60 +335,78 @@ def main():
 
     # --- Parser for the "encode" command ---
     parser_encode = subparsers.add_parser('encode', help='Compress PDFs into coldpress format.')
-    parser_encode.add_argument('input', metavar='input.fits', type=str, help='name of input FITS catalog')
-    parser_encode.add_argument('output', metavar='output.fits', type=str, help='name of output FITS catalog')
-    parser_encode.add_argument('--pdfcol', type=str, nargs='?', default='PDF', help='name of column containing PDFs to compress')
-    parser_encode.add_argument('--out_pdfcol', type=str, nargs='?', default='coldpress_PDF', help='name of output column with cold-pressed PDF')
-    parser_encode.add_argument('--zmin', type=float, nargs='?', default=0., help='zmin of input PDFs')
-    parser_encode.add_argument('--zmax', type=float, required=True, help='zmax of input PDFs')
-    parser_encode.add_argument('--length', type=int, nargs='?', default=80, help='length of cold-pressed PDF in bytes (must be multiple of 4)')
-    parser_encode.add_argument('--validate', action='store_true', default=False, help='verify accuracy of recovered quantiles')
-    parser_encode.add_argument('--tolerance', type=float, nargs='?', default=0.001, help='maximum shift in redshift allowed for quantiles')
-    parser_encode.add_argument('--keep-orig', action='store_true', help='Keep the original PDF column in the output file.')
+    parser_encode.add_argument('input', metavar='input.fits', type=str, help='Name of input FITS catalog.')
+    parser_encode.add_argument('output', metavar='output.fits', type=str, help='Name of output FITS catalog.')
+    format_group = parser_encode.add_mutually_exclusive_group(required=True)
+    format_group.add_argument('--binned', type=str, help='Name of input column containing binned PDFs.')
+    format_group.add_argument('--samples', type=str, help='Name of input column containing a set of random samples from the PDFs.')
+    parser_encode.add_argument('--out-encoded', type=str, nargs='?', default='coldpress_PDF', help='Name of output column containing the cold-pressed PDFs.')
+    parser_encode.add_argument('--zmin', type=float, help='Redshift of the first bin (required with --binned).')
+    parser_encode.add_argument('--zmax', type=float, help='Redshift of the last bin (required with --binned).')
+    parser_encode.add_argument('--length', type=int, nargs='?', default=80, help='Length of cold-pressed PDFs in bytes (must be multiple of 4).')
+    parser_encode.add_argument('--validate', action='store_true', default=False, help='Verify accuracy of recovered quantiles.')
+    parser_encode.add_argument('--tolerance', type=float, nargs='?', default=0.001, help='Maximum shift tolerated for the redshift of the quantiles.')
+    parser_encode.add_argument('--keep-orig', action='store_true', help='Include the original input column with binned PDFs or samples in the output file.')
 
     parser_encode.set_defaults(func=encode_logic) # This links the 'encode' command to its function
 
     # --- Parser for the "decode" command ---
-    parser_decode = subparsers.add_parser('decode', help='Decompress PDFs from coldpress format.')
-    parser_decode.add_argument('input', type=str, help='name of input FITS catalog')
-    parser_decode.add_argument('output', type=str, help='name of output FITS catalog')
-    parser_decode.add_argument('--pdfcol', type=str, nargs='?', default='coldpress_PDF', help='name of column containing compressed PDFs')
-    parser_decode.add_argument('--out_pdfcol', type=str, nargs='?', default='PDF_decoded', help='name of output column for extracted PDFs')
-    parser_decode.add_argument('--zmin', type=float, default=0., help='zmin of output PDFs (default: 0.0)')
-    parser_decode.add_argument('--zmax', type=float, required=True, help='zmax of output PDFs')
-    parser_decode.add_argument('--zstep', type=float, required=True, help='zstep of output PDFs')
-    parser_decode.add_argument('--force-range', action='store_true', help='force binning to the range given by [zmin,zmax] even if some PDFs are truncated')
+    parser_decode = subparsers.add_parser('decode', help='Extract PDFs previously encoded with ColdPress.')
+    parser_decode.add_argument('input', type=str, help='Name of input FITS catalog')
+    parser_decode.add_argument('output', type=str, help='Name of output FITS catalog')
+    parser_decode.add_argument('--encoded', type=str, nargs='?', default='coldpress_PDF', help='Name of column containing cold-pressed PDFs.')
+    parser_decode.add_argument('--out-binned', type=str, nargs='?', default='PDF_decoded', help='Name of output column for extracted binned PDFs.')
+    parser_decode.add_argument('--zmin', type=float, help='Redshift of the first bin (required with --out-binned).')
+    parser_decode.add_argument('--zmax', type=float, help='Redshift of the last bin (required with --out-binned).')
+    parser_decode.add_argument('--zstep', type=float, help='Width of the redshift bins (required with --out_binned).')
+    parser_decode.add_argument('--force-range', action='store_true', help='Force binning to the range given by [zmin,zmax] even if some PDFs are truncated.')
 
     parser_decode.set_defaults(func=decode_logic) # This links the 'decode' command to its function
 
     # --- Parser for the "measure" command ---
     parser_measure = subparsers.add_parser('measure', help='Compute point estimates from compressed PDFs.')
-    parser_measure.add_argument('input', type=str, help='name of input FITS table containing compressed PDFs')
-    parser_measure.add_argument('output', type=str, help='name of output FITS table with new point estimate columns')
-    parser_measure.add_argument('--pdfcol', type=str, nargs='?', default='coldpress_PDF',
-                                help='name of column containing cold-pressed PDFs')
-                                
+    parser_measure.add_argument('input', type=str, help='Name of input FITS table containing cold-pressed PDFs.')
+    parser_measure.add_argument('output', type=str, help='Name of output FITS table containing point estimates from the PDFs.')
+    parser_measure.add_argument('--encoded', type=str, nargs='?', default='coldpress_PDF', help='Name of column containing cold-pressed PDFs.')
+    parser_measure.add_argument('--quantities', type=str, nargs='+', default=['all'], help='List of quantities to measure from the PDFs. Default: "all". Choose any or all of these: Z_MODE Z_MEAN Z_MEDIAN Z_RANDOM Z_MODE_ERR Z_MEAN_ERR ODDS_MODE ODDS_MEAN Z_MIN_HPDCI68 Z_MAX_HPCI68 Z_MIN_HPCI95 Z_MAX_HPDCI95 ALL')
+    parser_measure.add_argument('--odds-window', type=float, default=0.03, help='Half-width of the integration window for odds calculation (default: 0.03).')                              
+
     parser_measure.set_defaults(func=measure_logic)
 
     # --- Parser for the "plot" command ---
-    parser_plot = subparsers.add_parser('plot', help='Plot reconstructed PDFs from compressed data.')
-    parser_plot.add_argument('input', type=str, help='name of input FITS table containing compressed PDFs')
+    parser_plot = subparsers.add_parser('plot', help='Reconstruct and plot PDFs encoded with ColdPress.')
+    parser_plot.add_argument('input', type=str, help='Name of input FITS table containing cold-pressed PDFs.')
     plot_group = parser_plot.add_mutually_exclusive_group(required=True)
-    plot_group.add_argument('--id', nargs='+', type=int, help='One or more source IDs to plot.')
-    plot_group.add_argument('--all', action='store_true', help='Plot PDFs for all sources in the file.')
-    parser_plot.add_argument('--pdfcol', type=str, nargs='?', default='coldpress_PDF',
-                                help='name of column containing cold-pressed PDFs')
+    plot_group.add_argument('--id', nargs='+', type=str, help='List of ID(s) of the source(s) to plot.')
+    plot_group.add_argument('--plot-all', action='store_true', help='Plot PDFs for all the sources in the file.')
+    parser_plot.add_argument('--idcol', type=str, help='Name of input column containing source IDs.')
+    parser_plot.add_argument('--encoded', type=str, nargs='?', default='coldpress_PDF',
+                                help='Name of input column containing cold-pressed PDFs.')
     parser_plot.add_argument('--outdir', type=str, default='.',
-                                help='Output directory for plot files (default: current directory)')
+                                help='Output directory for plot files (default: current directory).')
     parser_plot.add_argument('--format', type=str, default='png',
-                                help='Output format for plots (e.g., png, pdf, jpg; default: png)')
-    parser_plot.add_argument('--method', type=str, default='linear', choices=['steps', 'spline', 'all'],
-                                help='PDF reconstruction method for plotting (default: all)')
+                                help='Output format for plots (e.g., png, pdf, jpg; default: png).')
+    parser_plot.add_argument('--method', type=str, default='all', choices=['steps', 'spline', 'all'],
+                                help='PDF reconstruction method for plots (default: all).')
 
     parser_plot.set_defaults(func=plot_logic)
 
     # Parse the arguments and call the function that was set by set_defaults
     args = parser.parse_args()
+    
+    # post-validation of arguments
+    
+    if args.command == 'encode':
+        # Enforce zmin/zmax with --pdfcol, forbid with --samples
+        if args.binned:
+            if args.zmin is None or args.zmax is None:
+                parser.error('--zmin and --zmax are required when encoding from binned PDFs (--pdfcol)')
+        else:
+            # samples mode
+            if args.zmin is not None or args.zmax is not None:
+                parser.error('--zmin and --zmax can only be used with binned PDFs (--pdfcol), not random samples (--samples)')
+
+    # Call the selected command function
     args.func(args)
 
 if __name__ == '__main__':
