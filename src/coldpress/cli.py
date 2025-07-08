@@ -149,8 +149,6 @@ def measure_logic(args):
     qcold = data[args.encoded]
     Nsources = qcold.shape[0]
 
-    # --- New logic for --quantities argument ---
-
     # Define all possible quantities and their dependencies.
     # FITS column names are case-insensitive, but we'll use uppercase for consistency.
     all_quantities = {
@@ -193,9 +191,6 @@ def measure_logic(args):
 
     valid = np.any(qcold != 0, axis=1)
                
-#    d['Z_FLAGS'] = np.zeros(Nsources, dtype=np.int16)
-#    d['Z_FLAGS'][~valid] = 1024 # Flag for no PDF info
-
     valid_indices = np.where(valid)[0]
     print(f"Calculating point estimates for {len(valid_indices)} valid sources...")
     
@@ -324,6 +319,99 @@ def plot_logic(args):
         plt.close()
         print(f"Saved plot to {output_filename}")
 
+# --- Logic for the 'check' command ---
+def check_logic(args):
+    """Logic to check binner or compressed PDFs."""
+    print(f"Opening input file: {args.input}")
+    with fits.open(args.input) as h:
+        data = h[1].data
+        header = h[1].header
+        original_columns = data.columns
+        if args.list is not None:
+            ID = data[args.idcol]
+        
+        # Check PDFs
+        if args.binned is None:
+            samples = data[args.samples]
+            invalid = (np.sum(~np.isfinite(samples),axis=1) > 0) # samples considered invalid if it has any non-finite elements 
+            v = ~invalid # sources with valid samples
+            unresolved = (np.max(samples[v],axis=1)-np.min(samples[v],axis=1) == 0) # all samples have the same value
+        
+        else:
+            PDF = data[args.binned]
+            invalid = (np.sum(~np.isfinite(PDF),axis=1) > 0) | (np.nanmin(PDF,axis=1) < 0) | (np.nanmax(PDF,axis=1) == 0.) # PDF is invalid if it has any non-finite or negative elements or if all elements are 0
+            v = ~invalid # sources with valid samples
+            unresolved = (np.sum(PDF[v],axis=1)-np.max(PDF[v],axis=1) == 0) # only one non-zero element in PDF
+        
+            threshold = args.truncation_threshold * np.max(PDF[v],axis=1)
+            truncated = ((PDF[v,0] > threshold) | (PDF[v,-1] > threshold)) # PDF has too much weight on one or both extremes. Probably it is truncated.
+    
+    # Write summary report
+    if args.binned is None:
+        print(f'Column {args.samples} contains {samples.shape[0]} sampled PDFs, each containing {samples.shape[1]} random redshift samples.')
+    else:    
+        print(f'Column {args.binned} contains {PDF.shape[0]} binned PDFs, each containing {PDF.shape[1]} redshift bins.')
+    
+    Ninvalid = len(invalid[invalid])
+    print(f"{Ninvalid} PDFs have been flagged as 'invalid'")
+    Nunresolved = len(unresolved[unresolved])
+    print(f"{Nunresolved} PDFs have been flagged as 'unresolved'")
+    Ntruncated = len(truncated[truncated])
+    print(f"{Ntruncated} PDFs have been flagged as 'truncated'")
+        
+    if args.list:
+        print('List of source IDs with flagged issues in their PDFs:')
+        for source in ID[invalid]:
+            print(f"{source}  invalid")
+        for i, source in enumerate(ID[v]):
+            tag = ""
+            if unresolved[i]:
+                tag += " unresolved"
+            if truncated[i]:
+                tag += " truncated"
+                    
+            if tag != "":
+                print(f"ID = {i}:{tag}")
+    
+    if args.output:                                
+        # Write flags to output table
+        d = {}
+        d['Z_FLAGS'] = np.zeros(invalid.shape[0], dtype=np.int16)
+        d['PDF_invalid'] = invalid
+        d['PDF_unresolved'] = np.zeros(invalid.shape[0],dtype=bool)
+        d['PDF_unresolved'][v] = unresolved
+        d['Z_FLAGS'][d['PDF_invalid']] = 1
+        d['Z_FLAGS'][d['PDF_unresolved']] += 2
+        if args.binned is not None:
+            d['PDF_truncated'] = np.zeros(invalid.shape[0],dtype=bool)
+            d['PDF_truncated'][v] = truncated
+            d['Z_FLAGS'][d['PDF_truncated']] += 4
+
+        # Create a list of all columns for the new table, starting with original ones
+        final_cols = []
+        new_col_names = d.keys()
+        for col in original_columns:
+            # Add original columns unless they are being replaced by a new one
+            if col.name not in new_col_names:
+                final_cols.append(col)
+
+        # Add all the new columns we just calculated
+        for name, array in d.items():
+            if array.dtype == np.float32:
+                format_str = 'E'
+            elif array.dtype == np.int16:
+                format_str = 'I'
+            elif array.dtype == bool:
+                format_str = 'L'    
+            final_cols.append(fits.Column(name=name, format=format_str, array=array))
+
+        new_hdu = fits.BinTableHDU.from_columns(final_cols, header=header)
+        new_hdu.header['HISTORY'] = f'Added flags columns indicating issues in the PDFs: {new_col_names}'
+        print(f"Writing point estimates to: {args.output}")
+        new_hdu.writeto(args.output, overwrite=True)
+        print('Done.')
+            
+            
 # --- Main Entry Point and Parser Configuration ---
 def main():
     parser = argparse.ArgumentParser(
@@ -390,22 +478,39 @@ def main():
                                 help='PDF reconstruction method for plots (default: all).')
 
     parser_plot.set_defaults(func=plot_logic)
+    
+    # --- Parser for the "check" command ---
+    parser_check = subparsers.add_parser('check', help='Check the PDFs for issues and flag them.')
+    parser_check.add_argument('input', type=str, help='Name of input FITS catalog.')
+    parser_check.add_argument('output', type=str, nargs='?', help='(Optional) name of output FITS catalog.')
+    check_group = parser_check.add_mutually_exclusive_group(required=True)
+    check_group.add_argument('--binned', type=str, help='Name of input column containing binned PDFs.')
+    check_group.add_argument('--encoded', type=str, help='Name of input column containing cold-pressed PDFs.')
+    parser_check.add_argument('--truncation-threshold', type=float, default=0.05, help='Threshold value for PDF truncation detection (default: 0.05)')
+    parser_check.add_argument('--list', action='store_true', help='List ID and flags of all flagged PDFs.')
+    parser_check.add_argument('--idcol', type=str, help='Name of input column containing source IDs (required with --list).')
+
+    parser_check.set_defaults(func=check_logic)
 
     # Parse the arguments and call the function that was set by set_defaults
     args = parser.parse_args()
     
     # post-validation of arguments
-    
     if args.command == 'encode':
         # Enforce zmin/zmax with --pdfcol, forbid with --samples
         if args.binned:
             if args.zmin is None or args.zmax is None:
-                parser.error('--zmin and --zmax are required when encoding from binned PDFs (--pdfcol)')
+                parser.error('--zmin and --zmax are required when encoding from binned PDFs (--binned)')
         else:
             # samples mode
             if args.zmin is not None or args.zmax is not None:
-                parser.error('--zmin and --zmax can only be used with binned PDFs (--pdfcol), not random samples (--samples)')
+                parser.error('--zmin and --zmax can only be used with binned PDFs (--binned), not random samples (--samples)')
 
+    if args.command == 'check':
+        if args.list:
+            if args.idcol is None:
+                parser.error('--idcol is required when listing sources with flagged issues in their PDFs ( --list)')
+                
     # Call the selected command function
     args.func(args)
 
