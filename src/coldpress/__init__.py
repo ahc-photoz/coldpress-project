@@ -25,6 +25,7 @@ __copyright__ = "Copyright 2025, Antonio Hernán Caballero"
 from .encode import encode_from_histograms, encode_from_samples
 from .decode import decode_to_histograms, decode_to_cdf, decode_quantiles
 from .stats import (
+    measure_from_quantiles,
     zmode_from_quantiles,
     zmedian_from_quantiles,
     zmean_from_quantiles,
@@ -41,6 +42,7 @@ __all__ = [
     'decode_to_histograms',
     'decode_to_cdf',
     'decode_quantiles',
+    'measure_from_quantiles',
     'zmode_from_quantiles',
     'zmedian_from_quantiles',
     'zmean_from_quantiles',

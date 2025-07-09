@@ -1,5 +1,83 @@
 import numpy as np
 
+ALL_QUANTITIES = {
+    'Z_MODE', 'Z_MEAN', 'Z_MEDIAN', 'Z_RANDOM', 'Z_MODE_ERR', 'Z_MEAN_ERR',
+    'ODDS_MODE', 'ODDS_MEAN', 'Z_MIN_HPDCI68', 'Z_MAX_HPDCI68',
+    'Z_MIN_HPDCI95', 'Z_MAX_HPDCI95'
+}
+
+def measure_from_quantiles(quantiles, quantities_to_measure, odds_window=0.03):
+    """
+    Computes a set of statistical quantities from a single PDF's quantiles.
+
+    Args:
+        quantiles (np.ndarray): The array of quantile values for one PDF.
+        quantities_to_measure (list): A list of strings of the desired quantities.
+                                      Use 'ALL' to compute all available quantities.
+        odds_window (float, optional): Half-width for the odds calculation. Defaults to 0.03.
+
+    Raises:
+        ValueError: If an unknown quantity is requested.
+
+    Returns:
+        dict: A dictionary mapping the name of each requested quantity to its value.
+    """
+    dependencies = {
+        'Z_MODE_ERR': ['Z_MODE'],
+        'ODDS_MODE': ['Z_MODE'],
+        'ODDS_MEAN': ['Z_MEAN']
+    }
+
+    # Determine which quantities to compute
+    requested_q = {q.upper() for q in quantities_to_measure}
+
+    if 'ALL' in requested_q:
+        q_to_compute = ALL_QUANTITIES
+    else:
+        unknown_q = requested_q - ALL_QUANTITIES
+        if unknown_q:
+            raise ValueError(f"Unknown quantities specified: {', '.join(unknown_q)}")
+        q_to_compute = requested_q
+
+    # Resolve dependencies to determine all internal calculations needed
+    internal_calcs = set(q_to_compute)
+    for q in q_to_compute:
+        if q in dependencies:
+            internal_calcs.update(dependencies[q])
+
+    # --- Perform all necessary calculations ---
+    temp_results = {}
+    if 'Z_MODE' in internal_calcs:
+        temp_results['Z_MODE'] = zmode_from_quantiles(quantiles, width=0.005)
+    if 'Z_MEAN' in internal_calcs:
+        temp_results['Z_MEAN'] = zmean_from_quantiles(quantiles)
+    if 'Z_MEDIAN' in internal_calcs:
+        temp_results['Z_MEDIAN'] = zmedian_from_quantiles(quantiles)
+    if 'Z_RANDOM' in internal_calcs:
+        temp_results['Z_RANDOM'] = zrandom_from_quantiles(quantiles)
+    if 'Z_MEAN_ERR' in internal_calcs:
+        temp_results['Z_MEAN_ERR'] = zmean_err_from_quantiles(quantiles)
+    if 'ODDS_MODE' in internal_calcs:
+        temp_results['ODDS_MODE'] = odds_from_quantiles(quantiles, temp_results['Z_MODE'], odds_window=odds_window)
+    if 'ODDS_MEAN' in internal_calcs:
+        temp_results['ODDS_MEAN'] = odds_from_quantiles(quantiles, temp_results['Z_MEAN'], odds_window=odds_window)
+    if 'Z_MODE_ERR' in internal_calcs:
+        HPDCI68_mode_zmin, HPDCI68_mode_zmax = HPDCI_from_quantiles(quantiles, conf=0.68, zinside=temp_results['Z_MODE'])
+        temp_results['Z_MODE_ERR'] = 0.5 * (HPDCI68_mode_zmax - HPDCI68_mode_zmin)
+    if 'Z_MIN_HPDCI68' in internal_calcs or 'Z_MAX_HPDCI68' in internal_calcs:
+        HPDCI68_zmin, HPDCI68_zmax = HPDCI_from_quantiles(quantiles, conf=0.68, zinside=None)
+        temp_results['Z_MIN_HPDCI68'] = HPDCI68_zmin
+        temp_results['Z_MAX_HPDCI68'] = HPDCI68_zmax
+    if 'Z_MIN_HPDCI95' in internal_calcs or 'Z_MAX_HPDCI95' in internal_calcs:
+        HPDCI95_zmin, HPDCI95_zmax = HPDCI_from_quantiles(quantiles, conf=0.95, zinside=None)
+        temp_results['Z_MIN_HPDCI95'] = HPDCI95_zmin
+        temp_results['Z_MAX_HPDCI95'] = HPDCI95_zmax
+
+    # Filter the results to return only the originally requested quantities
+    final_results = {key: temp_results[key] for key in q_to_compute if key in temp_results}
+    
+    return final_results
+
 def zmode_from_quantiles(quantiles, width=0.005):
     """More robust approach against effects of z quantization in very narrow peaks."""
     Nq = len(quantiles)

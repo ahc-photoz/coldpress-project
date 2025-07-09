@@ -10,15 +10,7 @@ from astropy.io import fits
 # Use relative imports from the new submodules
 from .encode import encode_from_histograms, encode_from_samples
 from .decode import decode_to_histograms, decode_quantiles, cdf_to_pdf
-from .stats import (
-    zmode_from_quantiles,
-    zmedian_from_quantiles,
-    zmean_from_quantiles,
-    zrandom_from_quantiles,
-    zmean_err_from_quantiles,
-    odds_from_quantiles,
-    HPDCI_from_quantiles,
-)
+from .stats import measure_from_quantiles, ALL_QUANTITIES
 from .utils import reconstruct_pdf_from_quantiles
 
 # --- Logic for the 'info' command ---
@@ -59,6 +51,7 @@ def info_logic(args):
     except Exception as e:
         print(f"An error occurred: {e}", file=sys.stderr)
         sys.exit(1)
+
 
 # --- Logic for the 'encode' command ---
 def encode_logic(args):
@@ -153,10 +146,9 @@ def decode_logic(args):
     new_hdu.writeto(args.output, overwrite=True)
     print('Done.')
 
-
 # --- Logic for the 'measure' command ---
 def measure_logic(args):
-    # This function's content remains the same
+    """Logic to compute point estimates from compressed PDFs."""
     print(f"Opening input file: {args.input}")
     with fits.open(args.input) as h:
         data = h[1].data
@@ -166,39 +158,25 @@ def measure_logic(args):
     qcold = data[args.encoded]
     Nsources = qcold.shape[0]
     
-    all_quantities = {
-        'Z_MODE', 'Z_MEAN', 'Z_MEDIAN', 'Z_RANDOM', 'Z_MODE_ERR', 'Z_MEAN_ERR',
-        'ODDS_MODE', 'ODDS_MEAN', 'Z_MIN_HPDCI68', 'Z_MAX_HPDCI68',
-        'Z_MIN_HPDCI95', 'Z_MAX_HPDCI95'
-    }
-    dependencies = {
-        'Z_MODE_ERR': ['Z_MODE'],
-        'ODDS_MODE': ['Z_MODE'],
-        'ODDS_MEAN': ['Z_MEAN']
-    }
-    
+    # Determine the final set of quantities to compute using the imported constant
     requested_q = {q.upper() for q in args.quantities}
-
     if 'ALL' in requested_q:
-        q_to_compute = all_quantities
+        q_to_compute = ALL_QUANTITIES
     else:
-        unknown_q = requested_q - all_quantities
+        # Validate against the single source of truth
+        unknown_q = requested_q - ALL_QUANTITIES
         if unknown_q:
             print(f"Error: Unknown quantities specified: {', '.join(unknown_q)}", file=sys.stderr)
-            print(f"Available quantities: {', '.join(sorted(list(all_quantities)))}", file=sys.stderr)
+            print(f"Available quantities are: {', '.join(sorted(list(ALL_QUANTITIES)))}", file=sys.stderr)
             sys.exit(1)
         q_to_compute = requested_q
-
-    internal_calcs = set(q_to_compute)
-    for q in q_to_compute:
-        if q in dependencies:
-            internal_calcs.update(dependencies[q])
     
     print(f"Will compute: {', '.join(sorted(list(q_to_compute)))}")
 
+    # Initialize arrays ONLY for the requested quantities
     d = {}
     for q_name in q_to_compute:
-        d[q_name] = np.full(Nsources, np.nan, dtype=np.float32)
+         d[q_name] = np.full(Nsources, np.nan, dtype=np.float32)
 
     valid = np.any(qcold != 0, axis=1)
     valid_indices = np.where(valid)[0]
@@ -206,44 +184,24 @@ def measure_logic(args):
     
     for i in valid_indices:
         quantiles = decode_quantiles(qcold[i].tobytes())
-        temp_results = {}
+        # The API function doesn't need to do validation, as we've done it already
+        results = measure_from_quantiles(
+            quantiles,
+            quantities_to_measure=list(q_to_compute),
+            odds_window=args.odds_window
+        )
+        for q_name, value in results.items():
+            d[q_name][i] = value
 
-        if 'Z_MODE' in internal_calcs:
-            temp_results['Z_MODE'] = zmode_from_quantiles(quantiles, width=0.005)
-        if 'Z_MEAN' in internal_calcs:
-            temp_results['Z_MEAN'] = zmean_from_quantiles(quantiles)
-        if 'Z_MEDIAN' in internal_calcs:
-            temp_results['Z_MEDIAN'] = zmedian_from_quantiles(quantiles)
-        if 'Z_RANDOM' in internal_calcs:
-            temp_results['Z_RANDOM'] = zrandom_from_quantiles(quantiles)
-        if 'Z_MEAN_ERR' in internal_calcs:
-            temp_results['Z_MEAN_ERR'] = zmean_err_from_quantiles(quantiles)
-        if 'ODDS_MODE' in internal_calcs:
-            temp_results['ODDS_MODE'] = odds_from_quantiles(quantiles, temp_results['Z_MODE'], odds_window=args.odds_window)
-        if 'ODDS_MEAN' in internal_calcs:
-            temp_results['ODDS_MEAN'] = odds_from_quantiles(quantiles, temp_results['Z_MEAN'], odds_window=args.odds_window)
-        if 'Z_MODE_ERR' in internal_calcs:
-            HPDCI68_mode_zmin, HPDCI68_mode_zmax = HPDCI_from_quantiles(quantiles, conf=0.68, zinside=temp_results['Z_MODE'])
-            temp_results['Z_MODE_ERR'] = 0.5 * (HPDCI68_mode_zmax - HPDCI68_mode_zmin)
-        if 'Z_MIN_HPDCI68' in internal_calcs or 'Z_MAX_HPDCI68' in internal_calcs:
-            HPDCI68_zmin, HPDCI68_zmax = HPDCI_from_quantiles(quantiles, conf=0.68, zinside=None)
-            temp_results['Z_MIN_HPDCI68'] = HPDCI68_zmin
-            temp_results['Z_MAX_HPDCI68'] = HPDCI68_zmax
-        if 'Z_MIN_HPDCI95' in internal_calcs or 'Z_MAX_HPDCI95' in internal_calcs:
-            HPDCI95_zmin, HPDCI95_zmax = HPDCI_from_quantiles(quantiles, conf=0.95, zinside=None)
-            temp_results['Z_MIN_HPDCI95'] = HPDCI95_zmin
-            temp_results['Z_MAX_HPDCI95'] = HPDCI95_zmax
-
-        for q_name in q_to_compute:
-            if q_name in temp_results:
-                d[q_name][i] = temp_results[q_name]
-
+    # Create a list of all columns for the new table
     final_cols = []
-    new_col_names = d.keys()
+    
+    # Add original columns unless they are being replaced by a new one
     for col in original_columns:
-        if col.name not in new_col_names:
+        if col.name not in q_to_compute:
             final_cols.append(col)
 
+    # Add all the new, computed columns
     for name, array in d.items():
         format_str = 'E' if array.dtype == np.float32 else 'I'
         final_cols.append(fits.Column(name=name, format=format_str, array=array))
@@ -253,6 +211,7 @@ def measure_logic(args):
     print(f"Writing point estimates to: {args.output}")
     new_hdu.writeto(args.output, overwrite=True)
     print('Done.')
+
 
 # --- Logic for the 'plot' command ---
 def plot_logic(args):
