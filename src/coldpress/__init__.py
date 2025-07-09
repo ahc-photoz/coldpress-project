@@ -22,8 +22,8 @@ __version__ = "1.0.0"
 __license__ = "GPLv3"
 __copyright__ = "Copyright 2025, Antonio Hernán Caballero"
 
-from .encode import encode_from_histograms, encode_from_samples
-from .decode import decode_to_histograms, decode_to_cdf, decode_quantiles
+from .encode import encode_from_binned, encode_from_samples
+from .decode import decode_quantiles, quantiles_to_binned, decode_to_binned 
 from .stats import (
     measure_from_quantiles,
     zmode_from_quantiles,

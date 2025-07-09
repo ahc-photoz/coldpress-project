@@ -1,7 +1,7 @@
 import numpy as np
 import struct
 
-def samples_to_cdf(samples, Nquantiles=100):
+def samples_to_quantiles(samples, Nquantiles=100):
     """ obtain a cumulative PDF by quantiles from random samples of the underlying PDF"""
     valid = np.isfinite(samples)
     zsorted = np.sort(samples[valid])
@@ -9,7 +9,7 @@ def samples_to_cdf(samples, Nquantiles=100):
     return np.quantile(zsorted, targets, method='linear')
 
 
-def pdf_to_cdf(z_grid, Pz, Nquantiles=100):
+def binned_to_quantiles(z_grid, Pz, Nquantiles=100):
     """ obtain a cumulative PDF by quantiles from a binned PDF (histogram)"""
 
     nonzero = np.where(Pz > 0)[0]
@@ -145,9 +145,9 @@ def batch_encode(data, ini_quantiles=71, packetsize=80, tolerance=None, validate
         lastgood = None
         while True:
             if data['format'] == 'PDF_histogram':    
-                quantiles = pdf_to_cdf(data['zvector'],data['PDF'][i],Nquantiles=Nquantiles)
+                quantiles = binned_to_quantiles(data['zvector'],data['PDF'][i],Nquantiles=Nquantiles)
             if data['format'] == 'samples':
-                quantiles = samples_to_cdf(data['samples'][i],Nquantiles=Nquantiles)
+                quantiles = samples_to_quantiles(data['samples'][i],Nquantiles=Nquantiles)
 
             try:
                 payload_length, packet = encode_quantiles(quantiles,packetsize=packetsize,tolerance=tolerance,validate=validate)
@@ -172,7 +172,7 @@ def batch_encode(data, ini_quantiles=71, packetsize=80, tolerance=None, validate
     return int32col
 
 
-def encode_from_histograms(PDF, zvector, ini_quantiles=71, packetsize=80, tolerance=None, validate=None, debug=False):
+def encode_from_binned(PDF, zvector, ini_quantiles=71, packetsize=80, tolerance=None, validate=None, debug=False):
     """
     Encode the PDFs given by the arrays PDF and zvector as a packet of bytes
     containing a compressed representation of the quantiles of the cumulative

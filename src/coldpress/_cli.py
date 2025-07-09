@@ -8,8 +8,8 @@ import numpy as np
 from astropy.io import fits
 
 # Use relative imports from the new submodules
-from .encode import encode_from_histograms, encode_from_samples
-from .decode import decode_to_histograms, decode_quantiles, cdf_to_pdf
+from .encode import encode_from_binned, encode_from_samples
+from .decode import decode_to_binned, decode_quantiles, quantiles_to_binned
 from .stats import measure_from_quantiles, ALL_QUANTITIES
 from .utils import reconstruct_pdf_from_quantiles, plot_from_quantiles
 
@@ -77,7 +77,7 @@ def encode_logic(args):
             coldpress_PDF = encode_from_samples(samples, packetsize=args.length, ini_quantiles=args.length-9,
                                                    validate=args.validate, tolerance=args.tolerance)        
         else:
-            coldpress_PDF = encode_from_histograms(PDF, zvector, packetsize=args.length, ini_quantiles=args.length-9,
+            coldpress_PDF = encode_from_binned(PDF, zvector, packetsize=args.length, ini_quantiles=args.length-9,
                                                    validate=args.validate, tolerance=args.tolerance)
         end = time.process_time()
         cpu_seconds = end - start
@@ -123,9 +123,9 @@ def decode_logic(args):
         zvector = np.arange(args.zmin, args.zmax + args.zstep/2, args.zstep)
         zvsize = len(zvector)
 
-        print("Decompressing PDFs...")
+        print(f"Decompressing PDFs using {args.method} interpolation of the quantiles...")
         try:
-            decoded_PDF = decode_to_histograms(coldpress_PDF, zvector, force_range=args.force_range)
+            decoded_PDF = decode_to_binned(coldpress_PDF, zvector, force_range=args.force_range, method=args.method)
         except ValueError as e:
             print(f"Error: {e}", file=sys.stderr)
             print("Hint: Use the --force-range flag to proceed with truncation at your own risk.", file=sys.stderr)
@@ -153,16 +153,11 @@ def measure_logic(args):
     qcold = data[args.encoded]
     Nsources = qcold.shape[0]
     
-    requested_q = {q.upper() for q in args.quantities}
-    if 'ALL' in requested_q:
+    # Argparse now handles validation via the 'choices' parameter.
+    # We only need to determine the final list of quantities to compute.
+    q_to_compute = {q.upper() for q in args.quantities}
+    if 'ALL' in q_to_compute:
         q_to_compute = ALL_QUANTITIES
-    else:
-        unknown_q = requested_q - ALL_QUANTITIES
-        if unknown_q:
-            print(f"Error: Unknown quantities specified: {', '.join(unknown_q)}", file=sys.stderr)
-            print(f"Available quantities are: {', '.join(sorted(list(ALL_QUANTITIES)))}", file=sys.stderr)
-            sys.exit(1)
-        q_to_compute = requested_q
     
     print(f"Will compute: {', '.join(sorted(list(q_to_compute)))}")
 
@@ -176,6 +171,7 @@ def measure_logic(args):
     
     for i in valid_indices:
         quantiles = decode_quantiles(qcold[i].tobytes())
+        # The API function call now passes the list determined by argparse
         results = measure_from_quantiles(
             quantiles,
             quantities_to_measure=list(q_to_compute),
@@ -214,9 +210,7 @@ def plot_logic(args):
 
     qcold = data[args.encoded]
 
-    # --- New: Validate that requested quantity columns exist ---
     if args.quantities:
-        # FITS columns are case-insensitive, so we compare uppercase names
         all_cols_upper = {c.upper() for c in data.columns.names}
         for q_col in args.quantities:
             if q_col.upper() not in all_cols_upper:
@@ -247,18 +241,15 @@ def plot_logic(args):
 
         quantiles = decode_quantiles(qcold[i].tobytes())
         
-        # --- New: Prepare the markers dictionary ---
         markers_to_plot = {}
         if args.quantities:
             for q_col in args.quantities:
-                # Find the actual case-sensitive column name for data access
                 actual_col_name = next((c for c in data.columns.names if c.upper() == q_col.upper()), None)
                 if actual_col_name:
                     markers_to_plot[q_col] = data[actual_col_name][i]
 
         output_filename = os.path.join(args.outdir, f"pdf_{source_id_val}.{args.format.lower()}")
         
-        # --- Updated call with the new 'markers' argument ---
         plot_from_quantiles(
             quantiles,
             output_filename=output_filename,
@@ -383,15 +374,19 @@ def main():
     parser_decode.add_argument('--zmax', type=float, help='Redshift of the last bin.')
     parser_decode.add_argument('--zstep', type=float, help='Width of the redshift bins.')
     parser_decode.add_argument('--force-range', action='store_true', help='Force binning to the range given by [zmin,zmax] even if some PDFs are truncated.')
+    parser_decode.add_argument('--method', type=str, nargs='?', default='linear', choices=['linear','spline'], help='Interpolation method for reconstruction of the binned PDF (default: linear).')
     parser_decode.set_defaults(func=decode_logic)
 
     # --- Parser for the "measure" command ---
     parser_measure = subparsers.add_parser('measure', help='Compute point estimates from compressed PDFs.')
-    parser_measure.add_argument('input', type=str, help='Name of input FITS table containing cold-pressed PDFs.')
-    parser_measure.add_argument('output', type=str, help='Name of output FITS table containing point estimates from the PDFs.')
+    parser_measure.add_argument('input', type=str, nargs='?', help='Name of input FITS table containing cold-pressed PDFs.')
+    parser_measure.add_argument('output', type=str, nargs='?', help='Name of output FITS table containing point estimates measured on the PDFs.')
     parser_measure.add_argument('--encoded', type=str, nargs='?', default='coldpress_PDF', help='Name of column containing cold-pressed PDFs.')
-    parser_measure.add_argument('--quantities', type=str, nargs='+', default=['all'], help='List of quantities to measure from the PDFs.')
-    parser_measure.add_argument('--odds-window', type=float, default=0.03, help='Half-width of the integration window for odds calculation.')                              
+    choices_list = sorted(list(ALL_QUANTITIES) + ['ALL'])
+    parser_measure.add_argument('--quantities', type=str, nargs='+', default=['all'], choices=choices_list, metavar='QUANTITY', help='List of quantities to measure from the PDFs (default: all).')
+    parser_measure.add_argument('--odds-window', type=float, default=0.03, help='Half-width of the integration window for odds calculation.')
+    parser_measure.add_argument('--list-quantities', action='store_true', help='List all available quantities and their descriptions.')
+                              
     parser_measure.set_defaults(func=measure_logic)
 
     # --- Parser for the "plot" command ---
@@ -405,7 +400,6 @@ def main():
     parser_plot.add_argument('--outdir', type=str, default='.', help='Output directory for plot files.')
     parser_plot.add_argument('--format', type=str, default='png', help='Output format for plots.')
     parser_plot.add_argument('--method', type=str, default='all', choices=['steps', 'spline', 'all'], help='PDF reconstruction method for plots.')
-    # New argument for quantities to plot
     parser_plot.add_argument('--quantities', nargs='+', type=str, help='List of FITS columns to overplot as vertical lines.')
     parser_plot.set_defaults(func=plot_logic)
     
@@ -428,8 +422,20 @@ def main():
             parser.error('--zmin and --zmax are required when encoding from binned PDFs (--binned)')
         if args.samples and (args.zmin is not None or args.zmax is not None):
             parser.error('--zmin and --zmax can only be used with binned PDFs (--binned), not random samples (--samples)')
+
     if args.command == 'check' and args.list and args.idcol is None:
         parser.error('--idcol is required when listing sources with flagged issues (--list)')
+
+    if args.command == 'measure' and args.list_quantities:
+        print("Available quantities for the 'measure' command:")
+        from .stats import QUANTITY_DESCRIPTIONS
+        for name, desc in QUANTITY_DESCRIPTIONS.items():
+            print(f"  {name:<15} {desc}")
+        sys.exit(0) # Exit after printing the list
+
+    if args.command == 'measure':
+        if not args.input or not args.output:
+            parser_measure.error("the following arguments are required: input, output")
 
     args.func(args)
 

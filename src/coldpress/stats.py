@@ -1,10 +1,23 @@
 import numpy as np
 
-ALL_QUANTITIES = {
-    'Z_MODE', 'Z_MEAN', 'Z_MEDIAN', 'Z_RANDOM', 'Z_MODE_ERR', 'Z_MEAN_ERR',
-    'ODDS_MODE', 'ODDS_MEAN', 'Z_MIN_HPDCI68', 'Z_MAX_HPDCI68',
-    'Z_MIN_HPDCI95', 'Z_MAX_HPDCI95'
+QUANTITY_DESCRIPTIONS = {
+    'Z_MODE': 'Mode of the redshift PDF, defined as the redshift with maximum probability density.',
+    'Z_MEAN': 'Mean of the redshift PDF, defined as the integral over z of z*P(z).',
+    'Z_MEDIAN': 'Median of the redshift PDF (i.e., the redshift that has a 50/50 chance of the true redshift being on either side).',
+    'Z_RANDOM': 'A random redshift value obtained with the PDF as the underlying probability distribution.',
+    'Z_MODE_ERR': '1-sigma uncertainty in Z_MODE.',
+    'Z_MEAN_ERR': '1-sigma uncertainty in Z_MEAN.',
+    'ODDS_MODE': 'Odds parameter for Z_MODE.',
+    'ODDS_MEAN': 'Odds parameter for Z_MEAN.',
+    'Z_MIN_HPDCI68': 'Lower bound of the 68% highest posterior density credible interval.',
+    'Z_MAX_HPDCI68': 'Upper bound of the 68% highest posterior density credible interval.',
+    'Z_MIN_HPDCI95': 'Lower bound of the 95% highest posterior density credible interval.',
+    'Z_MAX_HPDCI95': 'Upper bound of the 95% highest posterior density credible interval.',
+    'ODDS_MODE': 'Probability that the true redshift lies within a specific interval around Z_MODE (default is ± 0.03 × (1 + Z_MODE).',
+    'ODDS_MEAN': 'Probability that the true redshift lies within a specific interval around Z_MEAN (default is ± 0.03 × (1 + Z_MEAN).'
 }
+
+ALL_QUANTITIES = set(QUANTITY_DESCRIPTIONS.keys())
 
 def measure_from_quantiles(quantiles, quantities_to_measure, odds_window=0.03):
     """
