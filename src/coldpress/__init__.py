@@ -34,7 +34,7 @@ from .stats import (
     odds_from_quantiles,
     HPDCI_from_quantiles,
 )
-from .utils import reconstruct_pdf_from_quantiles
+from .utils import reconstruct_pdf_from_quantiles, plot_from_quantiles
 
 __all__ = [
     'encode_from_histograms',
@@ -50,5 +50,6 @@ __all__ = [
     'zrandom_from_quantiles',
     'odds_from_quantiles',
     'HPDCI_from_quantiles',
-    'reconstruct_pdf_from_quantiles'
+    'reconstruct_pdf_from_quantiles',
+    'plot_from_quantiles'
 ]

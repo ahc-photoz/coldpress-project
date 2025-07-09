@@ -11,7 +11,7 @@ from astropy.io import fits
 from .encode import encode_from_histograms, encode_from_samples
 from .decode import decode_to_histograms, decode_quantiles, cdf_to_pdf
 from .stats import measure_from_quantiles, ALL_QUANTITIES
-from .utils import reconstruct_pdf_from_quantiles
+from .utils import reconstruct_pdf_from_quantiles, plot_from_quantiles
 
 # --- Logic for the 'info' command ---
 def info_logic(args):
@@ -26,15 +26,13 @@ def info_logic(args):
             
             print(f"Inspecting '{args.input}'...")
             
-            # Handle Table HDUs (BinTableHDU or TableHDU)
-            if hdu.is_image == False:
+            if not hdu.is_image:
                 print(f"HDU {args.hdu} (Name: '{hdu.name}')")
                 print(f"  Rows: {hdu.header['NAXIS2']}")
                 print(f"  Columns: {len(hdu.columns)}")
                 print("  --- Column Details ---")
                 for col in hdu.columns:
                     print(f"    - Name: {col.name:<20} Format: {col.format}")
-            # Handle Image HDUs
             else:
                 print(f"HDU {args.hdu} is an Image HDU (Name: '{hdu.name}')")
                 print(f"  Dimensions: {hdu.shape}")
@@ -42,7 +40,6 @@ def info_logic(args):
 
             if args.header:
                 print("\n--- FITS Header ---")
-                # repr() provides a clean string representation of the header
                 print(repr(hdu.header))
 
     except FileNotFoundError:
@@ -55,7 +52,6 @@ def info_logic(args):
 
 # --- Logic for the 'encode' command ---
 def encode_logic(args):
-    # This function's content remains the same
     import time
     if args.length % 4 != 0:
         print(f"Error: Packet length (--length) must be a multiple of 4, but got {args.length}.", file=sys.stderr)
@@ -117,7 +113,6 @@ def encode_logic(args):
 
 # --- Logic for the 'decode' command ---
 def decode_logic(args):
-    # This function's content remains the same
     print(f"Opening input file: {args.input}")
 
     with fits.open(args.input) as h:
@@ -158,12 +153,10 @@ def measure_logic(args):
     qcold = data[args.encoded]
     Nsources = qcold.shape[0]
     
-    # Determine the final set of quantities to compute using the imported constant
     requested_q = {q.upper() for q in args.quantities}
     if 'ALL' in requested_q:
         q_to_compute = ALL_QUANTITIES
     else:
-        # Validate against the single source of truth
         unknown_q = requested_q - ALL_QUANTITIES
         if unknown_q:
             print(f"Error: Unknown quantities specified: {', '.join(unknown_q)}", file=sys.stderr)
@@ -173,7 +166,6 @@ def measure_logic(args):
     
     print(f"Will compute: {', '.join(sorted(list(q_to_compute)))}")
 
-    # Initialize arrays ONLY for the requested quantities
     d = {}
     for q_name in q_to_compute:
          d[q_name] = np.full(Nsources, np.nan, dtype=np.float32)
@@ -184,7 +176,6 @@ def measure_logic(args):
     
     for i in valid_indices:
         quantiles = decode_quantiles(qcold[i].tobytes())
-        # The API function doesn't need to do validation, as we've done it already
         results = measure_from_quantiles(
             quantiles,
             quantities_to_measure=list(q_to_compute),
@@ -193,15 +184,11 @@ def measure_logic(args):
         for q_name, value in results.items():
             d[q_name][i] = value
 
-    # Create a list of all columns for the new table
     final_cols = []
-    
-    # Add original columns unless they are being replaced by a new one
     for col in original_columns:
         if col.name not in q_to_compute:
             final_cols.append(col)
 
-    # Add all the new, computed columns
     for name, array in d.items():
         format_str = 'E' if array.dtype == np.float32 else 'I'
         final_cols.append(fits.Column(name=name, format=format_str, array=array))
@@ -215,19 +202,27 @@ def measure_logic(args):
 
 # --- Logic for the 'plot' command ---
 def plot_logic(args):
-    # This function's content remains the same
-    try:
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("Error: matplotlib is required for the plot command.", file=sys.stderr)
-        sys.exit(1)
-
+    """Logic to plot PDFs from compressed data."""
     print(f"Opening input file: {args.input}")
     with fits.open(args.input) as h:
+        try:
+            import matplotlib
+        except ImportError:
+            print("Error: matplotlib is required for the plot command.", file=sys.stderr)
+            sys.exit(1)
         data = h[1].data
 
     qcold = data[args.encoded]
-    
+
+    # --- New: Validate that requested quantity columns exist ---
+    if args.quantities:
+        # FITS columns are case-insensitive, so we compare uppercase names
+        all_cols_upper = {c.upper() for c in data.columns.names}
+        for q_col in args.quantities:
+            if q_col.upper() not in all_cols_upper:
+                print(f"Error: Quantity column '{q_col}' not found in FITS table.", file=sys.stderr)
+                sys.exit(1)
+
     if args.plot_all:
         indices_to_plot = range(len(data))
         print(f"Plotting all {len(indices_to_plot)} sources...")
@@ -244,41 +239,37 @@ def plot_logic(args):
     os.makedirs(args.outdir, exist_ok=True)
 
     for i in indices_to_plot:
-        source_id = data[args.idcol][i] if args.idcol in data.columns.names else f"row_{i}"
+        source_id_val = data[args.idcol][i] if args.idcol in data.columns.names else f"row_{i}"
         
         if not np.any(qcold[i] != 0):
-            print(f"Skipping source {source_id}: No valid PDF data.")
+            print(f"Skipping source {source_id_val}: No valid PDF data.")
             continue
 
         quantiles = decode_quantiles(qcold[i].tobytes())
         
-        plt.figure(figsize=(8, 6))
+        # --- New: Prepare the markers dictionary ---
+        markers_to_plot = {}
+        if args.quantities:
+            for q_col in args.quantities:
+                # Find the actual case-sensitive column name for data access
+                actual_col_name = next((c for c in data.columns.names if c.upper() == q_col.upper()), None)
+                if actual_col_name:
+                    markers_to_plot[q_col] = data[actual_col_name][i]
 
-        if args.method == 'steps' or args.method == 'all':
-            z_steps, p_steps = reconstruct_pdf_from_quantiles(quantiles)
-            plt.step(z_steps[:-1], p_steps, where='post', label='steps')
-
-        if args.method == 'spline' or args.method == 'all':
-            zvector = np.linspace(quantiles[0],quantiles[-1],500)
-            pdf = cdf_to_pdf(quantiles, zvector=zvector, method='spline')
-            plt.plot(zvector, pdf, label='spline')            
-
-        plt.xlabel('Redshift (z)')
-        plt.ylabel('Probability Density P(z)')
-        plt.title(f'Reconstructed PDF for Source {source_id}')
-        plt.grid(True, alpha=0.4)
-        plt.legend()
-        plt.tight_layout()
-
-        output_filename = os.path.join(args.outdir, f"pdf_{source_id}.{args.format.lower()}")
-        plt.savefig(output_filename)
-        plt.close()
+        output_filename = os.path.join(args.outdir, f"pdf_{source_id_val}.{args.format.lower()}")
+        
+        # --- Updated call with the new 'markers' argument ---
+        plot_from_quantiles(
+            quantiles,
+            output_filename=output_filename,
+            source_id=source_id_val,
+            method=args.method,
+            markers=markers_to_plot
+        )
         print(f"Saved plot to {output_filename}")
-
 
 # --- Logic for the 'check' command ---
 def check_logic(args):
-    # This function's content remains the same
     print(f"Opening input file: {args.input}")
     with fits.open(args.input) as h:
         data = h[1].data
@@ -414,6 +405,8 @@ def main():
     parser_plot.add_argument('--outdir', type=str, default='.', help='Output directory for plot files.')
     parser_plot.add_argument('--format', type=str, default='png', help='Output format for plots.')
     parser_plot.add_argument('--method', type=str, default='all', choices=['steps', 'spline', 'all'], help='PDF reconstruction method for plots.')
+    # New argument for quantities to plot
+    parser_plot.add_argument('--quantities', nargs='+', type=str, help='List of FITS columns to overplot as vertical lines.')
     parser_plot.set_defaults(func=plot_logic)
     
     # --- Parser for the "check" command ---
