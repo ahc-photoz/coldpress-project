@@ -34,12 +34,12 @@ from .stats import (
     odds_from_quantiles,
     HPDCI_from_quantiles,
 )
-from .utils import reconstruct_pdf_from_quantiles, plot_from_quantiles
+from .utils import step_pdf_from_quantiles, plot_from_quantiles
 
 __all__ = [
-    'encode_from_histograms',
+    'encode_from_binned',
     'encode_from_samples',
-    'decode_to_histograms',
+    'decode_to_binned',
     'decode_to_cdf',
     'decode_quantiles',
     'measure_from_quantiles',

@@ -1,7 +1,37 @@
 import numpy as np
 import sys
 
-def reconstruct_pdf_from_quantiles(quantiles):
+def _monotone_natural_spline(Xout, X, Y):
+    """
+    Interpolate (X, Y) with a natural cubic spline, then correct any
+    non-monotonic intervals using PCHIP interpolation.
+    """
+    try:
+        from scipy.interpolate import CubicSpline, PchipInterpolator
+    except ImportError:
+        print("Error: scipy is required for spline interpolation.", file=sys.stderr)
+        return
+
+    spline = CubicSpline(X, Y, bc_type='natural')
+    pchip = PchipInterpolator(X, Y)
+    
+    Yout = spline(Xout)
+    
+    Yp  = spline(X, 1)
+    dYout = spline(Xout, 1)
+        
+    idx = np.searchsorted(X, Xout) - 1
+    idx = np.clip(idx, 0, len(X)-2)
+    
+    for i in range(len(X)-1):
+        mask = (idx == i) & ((dYout < 0) | (Yp[i] <= 0) | (Yp[i+1] <= 0))
+        if np.any(mask):
+            mask = (idx == i)
+            Yout[mask] = pchip(Xout[mask])
+             
+    return Yout
+    
+def step_pdf_from_quantiles(quantiles):
     """
     Reconstructs a stepwise PDF from its quantiles.
     """
@@ -31,17 +61,17 @@ def plot_from_quantiles(quantiles, output_filename, markers=None, source_id=None
         print("Error: matplotlib is required for plotting.", file=sys.stderr)
         return
 
-    from .decode import cdf_to_pdf
+    from .decode import quantiles_to_binned
     
     plt.figure(figsize=(8, 6))
 
     if method == 'steps' or method == 'all':
-        z_steps, p_steps = reconstruct_pdf_from_quantiles(quantiles)
+        z_steps, p_steps = step_pdf_from_quantiles(quantiles)
         plt.step(z_steps[:-1], p_steps, where='post', label='PDF (steps)')
 
     if method == 'spline' or method == 'all':
         zvector = np.linspace(quantiles[0], quantiles[-1], 500)
-        pdf = cdf_to_pdf(quantiles, zvector=zvector, method='spline')
+        pdf = quantiles_to_binned(quantiles, zvector=zvector, method='spline')
         plt.plot(zvector, pdf, label='PDF (spline)')
 
     # --- Updated logic to plot markers with colors and styles ---
@@ -54,16 +84,9 @@ def plot_from_quantiles(quantiles, output_filename, markers=None, source_id=None
         for i, (name, value) in enumerate(markers.items()):
             if value is not None and np.isfinite(value):
                 # Cycle through styles and colors using the index and modulo operator
-                current_style = linestyles[i % len(linestyles)]
-                current_color = colors[(i+2) % len(colors)]
-                
-                plt.axvline(
-                    x=value,
-                    linestyle=current_style,
-                    color=current_color,
-                    label=f'{name} = {value:.4f}',
-                    alpha=0.9
-                )
+                style = linestyles[i % len(linestyles)]
+                color = colors[(i+2) % len(colors)]
+                plt.axvline(x=value, linestyle=style, color=color, label=f'{name} = {value:.4f}', alpha=0.9)
 
     plt.xlabel('Redshift (z)')
     plt.ylabel('Probability Density P(z)')

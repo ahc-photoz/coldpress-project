@@ -118,7 +118,7 @@ def encode_quantiles(quantiles, packetsize=80, validate=True, tolerance=0.001):
 
     return L, bytes(packet)
 
-def batch_encode(data, ini_quantiles=71, packetsize=80, tolerance=None, validate=None, debug=False):
+def _batch_encode(data, ini_quantiles=71, packetsize=80, tolerance=None, validate=None, debug=False):
     """
     This function handles the batch encoding of multiple PDFs. Accepted input formats are:
      - PDF histograms
@@ -179,11 +179,11 @@ def encode_from_binned(PDF, zvector, ini_quantiles=71, packetsize=80, tolerance=
     distribution function.
     """
     data = {'format': 'PDF_histogram', 'zvector': zvector, 'PDF': PDF}    
-    return batch_encode(data, ini_quantiles=ini_quantiles, packetsize=packetsize, tolerance=tolerance, validate=validate, debug=debug)
+    return _batch_encode(data, ini_quantiles=ini_quantiles, packetsize=packetsize, tolerance=tolerance, validate=validate, debug=debug)
 
 def encode_from_samples(samples, ini_quantiles=71, packetsize=80, tolerance=None, validate=None, debug=False):
     """
     Encode as quantiles the PDFs given as an array individual random redshift samples taken from the underlying PDF.
     """   
     data = {'format': 'samples', 'samples': samples}
-    return batch_encode(data, ini_quantiles=ini_quantiles, packetsize=packetsize, tolerance=tolerance, validate=validate, debug=debug)
+    return _batch_encode(data, ini_quantiles=ini_quantiles, packetsize=packetsize, tolerance=tolerance, validate=validate, debug=debug)

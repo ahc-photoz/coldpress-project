@@ -1,7 +1,6 @@
 import numpy as np
 import struct
 import sys
-from scipy.interpolate import CubicSpline, PchipInterpolator
 
 def decode_quantiles(packet):
     """
@@ -36,12 +35,14 @@ def decode_quantiles(packet):
     zs.append(zmax)
     return np.array(zs)
 
-
 def quantiles_to_binned(z_quantiles, dz=None, Nbins=None, z_min=None, z_max=None, zvector=None, method='linear', force_range=False):
     """
     Given quantile locations, return a PDF on a regular grid.
     The grid can be defined by zvector, Nbins, or dz.
     """
+    if method == 'spline':
+        from .utils import _monotone_natural_spline
+
     # --- New and updated sanity checks for conflicting arguments ---
     if force_range and zvector is None and z_min is None and z_max is None:
         raise ValueError("force_range=True is only meaningful when an explicit range is provided via 'zvector' or 'z_min'/'z_max'.")
@@ -119,10 +120,14 @@ def quantiles_to_binned(z_quantiles, dz=None, Nbins=None, z_min=None, z_max=None
     else:
         return pdf
         
-def quantiles_to_samples(z_quantiles, Nsamples=100, method='linear'):
+def quantiles_to_samples(z_quantiles, Nsamples=100, method='linear', ss_factor=10):
     """
-    Given quantile locations, return Nsamples random samples of the PDF. 
-    """        
+    Given quantile locations z_quantiles (monotonic array of length M),
+    return Nsamples random samples of the PDF. 
+    """      
+    if method == 'spline':
+        from .utils import _monotone_natural_spline
+  
     zq = np.asarray(z_quantiles)
     M = len(zq)
     Fq = np.linspace(0.0, 1.0, M)
@@ -131,12 +136,9 @@ def quantiles_to_samples(z_quantiles, Nsamples=100, method='linear'):
 
     if method == 'linear':
         samples = np.interp(u, Fq, zq)
-    elif method == 'spline':
-        pchip = PchipInterpolator(Fq, zq)
-        samples = pchip(u)
-    else:
-        raise ValueError(f"Unknown method '{method}'. Choose 'linear' or 'spline'.")
-    
+    if method == 'spline':
+        samples = _monotone_natural_spline(u, Fq, zq)
+            
     return samples
     
 def decode_to_binned(int32col, zvector, force_range=False, method='linear'):
@@ -152,37 +154,28 @@ def decode_to_binned(int32col, zvector, force_range=False, method='linear'):
             qrecovered = decode_quantiles(packet)
 
             try:
-                PDF[i] = quantiles_to_binned(
-                    qrecovered, 
-                    zvector=zvector, 
-                    method=method, 
-                    force_range=force_range
-                )
+                PDF[i] = quantiles_to_binned(qrecovered, zvector=zvector, method=method, force_range=force_range)
             except ValueError as e:
                 raise ValueError(f"Source {i}: {e}") from e
 
     return PDF
+    
+def decode_to_samples(int32col, Nsamples=None, method='linear'):
+    """
+    Decode compressed PDFs to array of random samples from the PDF.
+    """
+    Nsources = int32col.shape[0]
+    samples = np.full((Nsources,Nsamples),np.nan,dtype=np.float32)
+    
+    for i in range(Nsources):
+        if np.any(int32col[i] != 0):
+            packet = int32col[i].tobytes()
+            qrecovered = decode_quantiles(packet)
 
-def _monotone_natural_spline(Xout, X, Y):
-    """
-    Interpolate (X, Y) with a natural cubic spline, then correct any
-    non-monotonic intervals using PCHIP interpolation.
-    """
-    spline = CubicSpline(X, Y, bc_type='natural')
-    pchip = PchipInterpolator(X, Y)
+            try:
+                samples[i] = quantiles_to_samples(qrecovered, Nsamples=Nsamples, method=method)
+            except ValueError as e:
+                raise ValueError(f"Source {i}: {e}") from e
+
+    return PDF
     
-    Yout = spline(Xout)
-    
-    Yp  = spline(X, 1)
-    dYout = spline(Xout, 1)
-        
-    idx = np.searchsorted(X, Xout) - 1
-    idx = np.clip(idx, 0, len(X)-2)
-    
-    for i in range(len(X)-1):
-        mask = (idx == i) & ((dYout < 0) | (Yp[i] <= 0) | (Yp[i+1] <= 0))
-        if np.any(mask):
-            mask = (idx == i)
-            Yout[mask] = pchip(Xout[mask])
-             
-    return Yout

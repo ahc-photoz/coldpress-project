@@ -8,10 +8,11 @@ import numpy as np
 from astropy.io import fits
 
 # Use relative imports from the new submodules
+from . import __version__
 from .encode import encode_from_binned, encode_from_samples
 from .decode import decode_to_binned, decode_quantiles, quantiles_to_binned
 from .stats import measure_from_quantiles, ALL_QUANTITIES
-from .utils import reconstruct_pdf_from_quantiles, plot_from_quantiles
+from .utils import step_pdf_from_quantiles, plot_from_quantiles
 
 # --- Logic for the 'info' command ---
 def info_logic(args):
@@ -338,7 +339,8 @@ def check_logic(args):
 
 # --- Main Entry Point and Parser Configuration ---
 def main():
-    parser = argparse.ArgumentParser(description='Compress or decompress PDFs in a FITS file using the coldpress algorithm.')
+    parser = argparse.ArgumentParser(description='Compression, analysis, and visualization of redshift PDFs.')
+    parser.add_argument('-v', '--version', action='version', version=f'%(prog)s {__version__}')
     subparsers = parser.add_subparsers(dest='command', required=True, help='Available commands')
 
     # --- Parser for the "info" command ---
@@ -355,7 +357,7 @@ def main():
     format_group = parser_encode.add_mutually_exclusive_group(required=True)
     format_group.add_argument('--binned', type=str, help='Name of input column containing binned PDFs.')
     format_group.add_argument('--samples', type=str, help='Name of input column containing a set of random samples from the PDFs.')
-    parser_encode.add_argument('--out-encoded', type=str, nargs='?', default='coldpress_PDF', help='Name of output column containing the cold-pressed PDFs.')
+    parser_encode.add_argument('-o', '--out-encoded', type=str, nargs='?', default='coldpress_PDF', help='Name of output column containing the cold-pressed PDFs.')
     parser_encode.add_argument('--zmin', type=float, help='Redshift of the first bin (required with --binned).')
     parser_encode.add_argument('--zmax', type=float, help='Redshift of the last bin (required with --binned).')
     parser_encode.add_argument('--length', type=int, nargs='?', default=80, help='Length of cold-pressed PDFs in bytes (must be multiple of 4).')
@@ -369,7 +371,7 @@ def main():
     parser_decode.add_argument('input', type=str, help='Name of input FITS catalog')
     parser_decode.add_argument('output', type=str, help='Name of output FITS catalog')
     parser_decode.add_argument('--encoded', type=str, nargs='?', default='coldpress_PDF', help='Name of column containing cold-pressed PDFs.')
-    parser_decode.add_argument('--out-binned', type=str, nargs='?', default='PDF_decoded', help='Name of output column for extracted binned PDFs.')
+    parser_decode.add_argument('-o', '--out-binned', type=str, nargs='?', default='PDF_decoded', help='Name of output column for extracted binned PDFs.')
     parser_decode.add_argument('--zmin', type=float, help='Redshift of the first bin.')
     parser_decode.add_argument('--zmax', type=float, help='Redshift of the last bin.')
     parser_decode.add_argument('--zstep', type=float, help='Width of the redshift bins.')
