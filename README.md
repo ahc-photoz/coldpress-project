@@ -171,7 +171,7 @@ coldpress plot hsc_sample_measured.fits --quantities Z_MODE Z_MEDIAN --idcol ID 
 ```
 ![Example of PDF with quantities marked](examples/pdf_73979566133084907.png)
 
->[!TIP] Use `--format JPEG` or `--format PDF` to save the figures in JPEG or PDF format. Use `--outdir <DIRECTORY>` to specify a different output directory.
+> [!TIP] Use `--format JPEG` or `--format PDF` to save the figures in JPEG or PDF format. Use `--outdir <DIRECTORY>` to specify a different output directory.
 
 
 ### 5. Decompress PDFs with `coldpress decode`
