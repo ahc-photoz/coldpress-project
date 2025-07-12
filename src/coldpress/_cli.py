@@ -221,12 +221,22 @@ def plot_logic(args):
     if args.plot_all:
         indices_to_plot = range(len(data))
         print(f"Plotting all {len(indices_to_plot)} sources...")
-    else:
+    elif args.first is not None:
+        if args.first <= len(data):
+            indices_to_plot = range(args.first)
+            print(f"Plotting first {len(indices_to_plot)} sources...")
+        else:
+            print(f"Warning: first {args.first} PDFs were requested but file contais only {len(data)}. Will plot all of them.")
+            indices_to_plot = range(len(data))
+    else:    
         if args.idcol not in data.columns.names:
             print(f"Error: --id specified, but no '{args.idcol}' column found in {args.input}", file=sys.stderr)
             sys.exit(1)
         source_ids = list(args.id)
-        indices_to_plot = np.where(np.isin(data[args.idcol], source_ids))[0]
+        id_column_as_str = data[args.idcol].astype(str)
+        source_ids_as_str = np.asarray(source_ids, dtype=str)
+        indices_to_plot = np.where(np.isin(id_column_as_str, source_ids_as_str))[0]
+
         if len(indices_to_plot) != len(source_ids):
             print("Warning: Some specified IDs were not found in the file.", file=sys.stderr)
         print(f"Found {len(indices_to_plot)} of {len(source_ids)} specified IDs to plot.")
@@ -234,7 +244,7 @@ def plot_logic(args):
     os.makedirs(args.outdir, exist_ok=True)
 
     for i in indices_to_plot:
-        source_id_val = data[args.idcol][i] if args.idcol in data.columns.names else f"row_{i}"
+        source_id_val = data[args.idcol][i] if (args.idcol is not None) and (args.idcol in data.columns.names) else f"row_{i}"
         
         if not np.any(qcold[i] != 0):
             print(f"Skipping source {source_id_val}: No valid PDF data.")
@@ -396,8 +406,9 @@ def main():
     parser_plot.add_argument('input', type=str, help='Name of input FITS table containing cold-pressed PDFs.')
     plot_group = parser_plot.add_mutually_exclusive_group(required=True)
     plot_group.add_argument('--id', nargs='+', type=str, help='List of ID(s) of the source(s) to plot.')
+    plot_group.add_argument('--first', metavar='N', type=int, help='plot PDFs for the first N sources in the file.')
     plot_group.add_argument('--plot-all', action='store_true', dest='plot_all', help='Plot PDFs for all the sources in the file.')
-    parser_plot.add_argument('--idcol', type=str, default='ID', help='Name of input column containing source IDs.')
+    parser_plot.add_argument('--idcol', type=str, nargs='?', help='Name of input column containing source IDs.')
     parser_plot.add_argument('--encoded', type=str, nargs='?', default='coldpress_PDF', help='Name of input column containing cold-pressed PDFs.')
     parser_plot.add_argument('--outdir', type=str, default='.', help='Output directory for plot files.')
     parser_plot.add_argument('--format', type=str, default='png', help='Output format for plots.')

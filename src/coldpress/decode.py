@@ -56,6 +56,7 @@ def quantiles_to_binned(z_quantiles, dz=None, Nbins=None, z_min=None, z_max=None
     # Grid creation logic
     if zvector is not None:
         z_grid = zvector
+        dz = zvector[1]-zvector[0]
     else:
         # Determine range boundaries, inferring from data if not provided
         range_min = zq[0] if z_min is None else z_min
@@ -76,7 +77,8 @@ def quantiles_to_binned(z_quantiles, dz=None, Nbins=None, z_min=None, z_max=None
             raise ValueError("Must provide one of 'zvector', 'Nbins', or 'dz'.")
 
     # Perform the range check on the final z_grid
-    zmin_q, zmax_q = zq[0], zq[-1]
+    eps = 1e-10
+    zmin_q, zmax_q = zq[0]+dz/2+eps, zq[-1]-dz/2-eps
     zmin_grid, zmax_grid = z_grid[0], z_grid[-1]
 
     if zmin_q < zmin_grid or zmax_q > zmax_grid:
